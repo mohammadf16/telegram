@@ -128,7 +128,7 @@ MARKET_CRYPTO_MAP = {
 
 NEWS_HTTP_TIMEOUT = max(3, int(os.getenv("NEWS_HTTP_TIMEOUT", "6")))
 NEWS_REFRESH_INTERVAL_MIN = max(10, int(os.getenv("NEWS_REFRESH_INTERVAL_MIN", "60")))
-NEWS_REFRESH_BUDGET_SEC = max(8, int(os.getenv("NEWS_REFRESH_BUDGET_SEC", "20")))
+NEWS_REFRESH_BUDGET_SEC = max(12, int(os.getenv("NEWS_REFRESH_BUDGET_SEC", "55")))
 FACTCHECK_QUERY_MAX = max(1, min(4, int(os.getenv("FACTCHECK_QUERY_MAX", "3"))))
 FACTCHECK_MAX_EVIDENCE = max(4, min(12, int(os.getenv("FACTCHECK_MAX_EVIDENCE", "8"))))
 NEWS_INDEX_KEEP_DAYS = max(7, int(os.getenv("NEWS_INDEX_KEEP_DAYS", "30")))
@@ -140,7 +140,7 @@ NEWS_REQUEST_HEADERS = {
     )
 }
 
-NEWS_SOURCE_FEEDS: list[dict[str, str]] = [
+NEWS_SOURCE_FEEDS_IR: list[dict[str, str]] = [
     {"name": "IRNA", "url": "https://www.irna.ir/rss", "region": "ir", "lang": "fa", "tier": "high"},
     {"name": "ISNA", "url": "https://www.isna.ir/rss", "region": "ir", "lang": "fa", "tier": "high"},
     {"name": "Mehr News", "url": "https://www.mehrnews.com/rss", "region": "ir", "lang": "fa", "tier": "medium"},
@@ -157,11 +157,24 @@ NEWS_SOURCE_FEEDS: list[dict[str, str]] = [
     {"name": "Hamshahri", "url": "https://www.hamshahrionline.ir/rss", "region": "ir", "lang": "fa", "tier": "medium"},
     {"name": "YJC", "url": "https://www.yjc.news/fa/rss/allnews", "region": "ir", "lang": "fa", "tier": "medium"},
     {"name": "Tabnak", "url": "https://www.tabnak.ir/fa/rss/allnews", "region": "ir", "lang": "fa", "tier": "medium"},
-    {"name": "Asr Iran", "url": "https://www.asriran.com/fa/rss/allnews", "region": "ir", "lang": "fa", "tier": "medium"},
+]
+
+NEWS_SOURCE_FEEDS_GLOBAL: list[dict[str, str]] = [
     {"name": "BBC", "url": "http://feeds.bbci.co.uk/news/world/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "BBC Business", "url": "http://feeds.bbci.co.uk/news/business/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "BBC Tech", "url": "http://feeds.bbci.co.uk/news/technology/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "BBC Science", "url": "http://feeds.bbci.co.uk/news/science_and_environment/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
     {"name": "CNN", "url": "http://rss.cnn.com/rss/edition.rss", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "CNN World", "url": "http://rss.cnn.com/rss/edition_world.rss", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "CNN Business", "url": "http://rss.cnn.com/rss/money_latest.rss", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "CNN Tech", "url": "http://rss.cnn.com/rss/edition_technology.rss", "region": "intl", "lang": "en", "tier": "medium"},
     {"name": "Reuters", "url": "https://feeds.reuters.com/reuters/worldNews", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "Reuters Business", "url": "https://feeds.reuters.com/reuters/businessNews", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "Reuters Top", "url": "https://feeds.reuters.com/reuters/topNews", "region": "intl", "lang": "en", "tier": "high"},
     {"name": "The Guardian", "url": "https://www.theguardian.com/world/rss", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "Guardian Business", "url": "https://www.theguardian.com/uk/business/rss", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "Guardian Tech", "url": "https://www.theguardian.com/uk/technology/rss", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "Guardian Science", "url": "https://www.theguardian.com/science/rss", "region": "intl", "lang": "en", "tier": "high"},
     {
         "name": "NYTimes",
         "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
@@ -169,12 +182,55 @@ NEWS_SOURCE_FEEDS: list[dict[str, str]] = [
         "lang": "en",
         "tier": "high",
     },
+    {"name": "NYTimes Business", "url": "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "NYTimes Technology", "url": "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "NYTimes Science", "url": "https://rss.nytimes.com/services/xml/rss/nyt/Science.xml", "region": "intl", "lang": "en", "tier": "high"},
     {"name": "Al Jazeera", "url": "https://www.aljazeera.com/xml/rss/all.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "Al Jazeera MiddleEast", "url": "https://www.aljazeera.com/xml/rss/all.xml?topic=middle-east", "region": "intl", "lang": "en", "tier": "high"},
     {"name": "DW", "url": "https://rss.dw.com/xml/rss-en-all", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "DW World", "url": "https://rss.dw.com/rdf/rss-en-world", "region": "intl", "lang": "en", "tier": "high"},
     {"name": "France24", "url": "https://www.france24.com/en/rss", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "France24 International", "url": "https://www.france24.com/en/international/rss", "region": "intl", "lang": "en", "tier": "medium"},
     {"name": "NPR", "url": "https://feeds.npr.org/1004/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
-    {"name": "AP", "url": "https://rsshub.app/apnews/topics/apf-topnews", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "NPR World", "url": "https://feeds.npr.org/1001/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "NPR Business", "url": "https://feeds.npr.org/1006/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "NPR Health", "url": "https://feeds.npr.org/1128/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "AP Top", "url": "https://rsshub.app/apnews/topics/apf-topnews", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "AP World", "url": "https://rsshub.app/apnews/topics/apf-intlnews", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "ABC News", "url": "https://abcnews.go.com/abcnews/topstories", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "CBS News", "url": "https://www.cbsnews.com/latest/rss/main", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "NBC News", "url": "https://feeds.nbcnews.com/nbcnews/public/news", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "Fox News", "url": "https://moxie.foxnews.com/google-publisher/latest.xml", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "CNBC Top", "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "CNBC World", "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "Euronews", "url": "https://www.euronews.com/rss?level=theme&name=news", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "Sky News", "url": "https://feeds.skynews.com/feeds/rss/world.xml", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "The Independent", "url": "https://www.independent.co.uk/news/world/rss", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "The Hill", "url": "https://thehill.com/feed/", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "VOA", "url": "https://www.voanews.com/api/epiqq", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "UN News", "url": "https://news.un.org/feed/subscribe/en/news/all/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "WSJ World", "url": "https://feeds.a.dj.com/rss/RSSWorldNews.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "WSJ Business", "url": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "FT World", "url": "https://www.ft.com/world?format=rss", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "FT Global Economy", "url": "https://www.ft.com/global-economy?format=rss", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "Bloomberg Markets", "url": "https://feeds.bloomberg.com/markets/news.rss", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "Bloomberg Politics", "url": "https://feeds.bloomberg.com/politics/news.rss", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "The Times of India", "url": "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "Hindustan Times", "url": "https://www.hindustantimes.com/feeds/rss/world-news/rssfeed.xml", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "The Hindu", "url": "https://www.thehindu.com/news/international/?service=rss", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "Straits Times", "url": "https://www.straitstimes.com/news/world/rss.xml", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "Japan Times", "url": "https://www.japantimes.co.jp/news/feed/world/", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "SCMP", "url": "https://www.scmp.com/rss/91/feed", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "SMH", "url": "https://www.smh.com.au/rss/feed.xml", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "The Age", "url": "https://www.theage.com.au/rss/feed.xml", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "CBC", "url": "https://www.cbc.ca/webfeed/rss/rss-world", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "CNA", "url": "https://www.channelnewsasia.com/rssfeeds/8395986", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "Deutsche Welle Business", "url": "https://rss.dw.com/xml/rss-en-business", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "Politico", "url": "https://www.politico.com/rss/politicopicks.xml", "region": "intl", "lang": "en", "tier": "medium"},
 ]
+
+NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE: list[dict[str, str]] = NEWS_SOURCE_FEEDS_GLOBAL[:50]
+NEWS_SOURCE_FEEDS: list[dict[str, str]] = NEWS_SOURCE_FEEDS_IR + NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE
 
 SOURCE_TIER_NAME_HINTS = {
     "reuters": "high",
@@ -203,6 +259,7 @@ SOURCE_TIER_NAME_HINTS = {
 
 SOURCE_TIER_WEIGHTS = {"high": 1.0, "medium": 0.78, "low": 0.55}
 FACT_LABEL_WEIGHTS = {"support": 1.0, "refute": -1.0, "related": 0.15, "irrelevant": 0.0}
+FACTCHECK_MODES = ("news", "brief", "pro")
 FACT_NEGATION_TERMS = (
     "تکذیب",
     "رد شد",
@@ -1587,19 +1644,24 @@ def _fmt_news_date(ts: int | None) -> str:
         return "--"
 
 
-def run_news_factcheck(text: str) -> dict[str, Any]:
+def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
     raw_text = _clean_html_text(text or "")
     if not raw_text:
         return {"ok": False, "error": "متن خبر خالی است."}
+    check_mode = normalize_text(mode)
+    if check_mode not in FACTCHECK_MODES:
+        check_mode = "news"
+    use_ai = check_mode == "pro" and bool(OPENAI_API_KEY)
 
-    claim = _ai_distill_claim(raw_text) or raw_text[:420]
+    claim = (_ai_distill_claim(raw_text) if use_ai else "") or raw_text[:420]
     claim = " ".join(claim.split())[:500]
     lang = _guess_news_lang(claim)
     translated = ""
-    if lang == "fa":
-        translated = _ai_translate_fact_text(claim, "en")
-    elif lang == "en":
-        translated = _ai_translate_fact_text(claim, "fa")
+    if use_ai:
+        if lang == "fa":
+            translated = _ai_translate_fact_text(claim, "en")
+        elif lang == "en":
+            translated = _ai_translate_fact_text(claim, "fa")
 
     queries: list[str] = [claim]
     if translated and normalize_text(translated) != normalize_text(claim):
@@ -1647,12 +1709,14 @@ def run_news_factcheck(text: str) -> dict[str, Any]:
         reverse=True,
     )
     selected = ranked[: max(FACTCHECK_MAX_EVIDENCE * 2, 12)]
-    ai_labels = _ai_label_evidence(claim, selected[:FACTCHECK_MAX_EVIDENCE])
+    ai_labels = _ai_label_evidence(claim, selected[:FACTCHECK_MAX_EVIDENCE]) if use_ai else {}
     scored = _score_factcheck(claim, selected[:FACTCHECK_MAX_EVIDENCE], ai_labels)
     top_evidence = scored.get("evidence", [])[:FACTCHECK_MAX_EVIDENCE]
-    ai_reasoning = _ai_factcheck_reasoning(claim, top_evidence, scored)
+    ai_reasoning = _ai_factcheck_reasoning(claim, top_evidence, scored) if use_ai else {}
     return {
         "ok": True,
+        "mode": check_mode,
+        "ai_used": use_ai,
         "claim": claim,
         "lang": lang,
         "translated_claim": translated,
@@ -1660,6 +1724,8 @@ def run_news_factcheck(text: str) -> dict[str, Any]:
         "refresh_info": refresh_info,
         "fetched_count": len(fetched),
         "candidate_count": len(ranked),
+        "configured_ir_sources": len(NEWS_SOURCE_FEEDS_IR),
+        "configured_global_sources": len(NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE),
         "ai_reasoning": ai_reasoning,
         **scored,
     }
@@ -1676,10 +1742,15 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
     translated = str(result.get("translated_claim", "")).strip()
     evidence = list(result.get("evidence", []))
     verdict = str(result.get("verdict", "نامطمئن"))
+    mode = normalize_text(str(result.get("mode", "news")))
+    ai_used = bool(result.get("ai_used", False))
     reasoning = result.get("ai_reasoning", {}) if isinstance(result.get("ai_reasoning"), dict) else {}
+    ir_count = int(result.get("configured_ir_sources", len(NEWS_SOURCE_FEEDS_IR)))
+    global_count = int(result.get("configured_global_sources", len(NEWS_SOURCE_FEEDS_GLOBAL)))
 
     lines = [
         "🧪 راستی‌آزمایی خبر",
+        f"🔧 حالت بررسی: {'پیشرفته (AI)' if mode == 'pro' else ('خیلی خلاصه' if mode == 'brief' else 'اخبار')}",
         f"🎯 ادعای اصلی: {claim}",
         f"🧭 نتیجه: {verdict}",
         f"• احتمال واقعی بودن: {truth_pct}٪",
@@ -1691,6 +1762,7 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
             f"مرتبط {int(result.get('related_count', 0))}"
         ),
         f"🌐 تنوع منبع: {int(result.get('source_count', 0))} منبع",
+        f"🗂 پایگاه بررسی: {global_count} منبع جهانی + {ir_count} منبع داخلی",
     ]
     if translated:
         lang = str(result.get("lang", "unknown"))
@@ -1699,7 +1771,7 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
         elif lang == "en":
             lines.append(f"🔄 ترجمه فارسی ادعا: {translated[:260]}")
 
-    if reasoning:
+    if mode == "pro" and reasoning:
         overall = str(reasoning.get("overall", "")).strip()
         why = str(reasoning.get("why", "")).strip()
         missing = str(reasoning.get("missing", "")).strip()
@@ -1730,10 +1802,13 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
                     lines.append(f"  ↳ {pwhy}")
         if missing:
             lines.append(f"🧩 شکاف اطلاعاتی: {missing}")
+    elif mode == "pro" and not ai_used:
+        lines.append("ℹ️ تحلیل پیشرفته AI فعال نشد (کلید API موجود نیست)؛ خروجی با موتور سندی داخلی تولید شد.")
 
     lines.append("🔎 منابع شاخص:")
     label_icon = {"support": "✅", "refute": "❌", "related": "➖", "irrelevant": "▫️"}
-    for idx, item in enumerate(evidence[:6], start=1):
+    source_limit = 3 if mode == "brief" else 6
+    for idx, item in enumerate(evidence[:source_limit], start=1):
         label = normalize_text(str(item.get("label", "related")))
         icon = label_icon.get(label, "▫️")
         source = str(item.get("source", "منبع ناشناس"))[:50]
@@ -1743,6 +1818,9 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
         lines.append(f"{idx}) {icon} [{source}] ({date_text}) {title}")
         if link:
             lines.append(link)
+
+    if mode == "brief":
+        lines.append("📝 جمع‌بندی کوتاه: این نتیجه سریع است؛ برای بررسی عمیق از /fact_pro استفاده کن.")
 
     lines.append("⚠️ این خروجی خودکار است و برای تصمیم حساس باید با منابع رسمی تکمیلی چک شود.")
 
@@ -3412,61 +3490,68 @@ def maybe_pin_report(chat_id: int, message_id: int, cfg: dict[str, Any]) -> None
 
 def help_text() -> str:
     return (
-        "🤖 راهنمای ربات\n"
-        "• راهنمای کامل قابلیت‌ها: /guide\n"
-        "• خصوصی: /prices یا /menu\n"
-        "• گروه: /gprices یا تریگر سفارشی (پیش فرض !prices)\n"
-        "• نمایش بیشترین تغییر: /top_changes\n"
-        "• پنل تعاملی گروه: /group_menu\n\n"
+        "🤖 راهنمای کامل دستورات ربات\n\n"
+        "📌 عمومی:\n"
+        "/start\n"
+        "/help | /menu\n"
+        "/guide | /full_guide | /group_guide\n\n"
+        "📈 بازار ارز/سکه/طلا/کریپتو:\n"
+        "/prices (خصوصی)\n"
+        "/gprices (گروه)\n"
+        "/top_changes\n"
+        "تریگر گروهی (پیش‌فرض): !prices\n\n"
+        "🤖 چت هوش مصنوعی:\n"
+        "/ai سوال | /ask سوال\n"
+        "/ai_new سوال | /asknew سوال\n"
+        "/ai_usage (گروه)\n"
+        "ادامه گفتگو: روی پاسخ AI ریپلای کن\n\n"
+        "🧠 خلاصه‌سازی متن (کاملا داخلی، بدون API):\n"
+        "/summarize متن | /sum متن | /tldr متن | /tl_dr متن | /kholase متن\n"
+        "یا روی پیام طولانی ریپلای کن و /summarize بزن\n\n"
+        "🧪 راستی‌آزمایی خبر:\n"
+        "/fact_news متن | /factcheck متن | /verify_news متن | /newscheck متن\n"
+        "/cred_short متن | /verify_short متن | /check_short متن\n"
+        "/fact_pro متن | /factcheck_pro متن | /verify_claim متن\n"
+        "یا روی خبر ریپلای کن و یکی از دستورات بالا را بزن\n\n"
+        "🎯 پیشنهاد محتوا:\n"
+        "/recommend_me (خصوصی)\n"
+        "/reco_on | /reco_off (گروه)\n"
+        "/set_reco_time 21:30 (گروه)\n"
+        "/send_reco_now (گروه)\n\n"
         "🎭 امتیاز شوخی گروه:\n"
-        "• روی پیام کسی ریپلای کن و بنویس: «کسشر شناسایی شد» یا «جمله طلایی»\n"
-        "• /scoreboard | /my_score\n\n"
-        "💰 خرج و دنگ:\n"
+        "روی پیام شخص ریپلای کن: «کسشر شناسایی شد» یا «جمله طلایی»\n"
+        "/scoreboard\n"
+        "/my_score\n\n"
+        "💰 خرج و دنگ گروهی:\n"
         "/add 480 پیتزا\n"
-        "/list_new خرید هفته\n"
-        "/lists\n"
+        "/list_new عنوان\n"
         "/list_use l2\n"
+        "/lists\n"
         "/join_split\n"
         "/list_add_member (روی پیام کاربر ریپلای)\n"
         "/list_remove_member (روی پیام کاربر ریپلای)\n"
         "/list_members\n"
         "/expenses\n"
         "/split\n"
-        "/clear_expenses\n\n"
-        "📡 فوروارد هوشمند کانال:\n"
-        "/fw_on | /fw_off\n"
-        "/fw_add_channel @channel یا -100...\n"
-        "/fw_del_channel @channel\n"
-        "/fw_add_keyword کلمه یا عبارت\n"
-        "/fw_del_keyword کلمه یا عبارت\n"
-        "/fw_list\n\n"
+        "/clear_expenses\n"
+        "/expense_panel\n\n"
         "📂 آرشیو گروه:\n"
         "/save کلید | مقدار\n"
         "/get کلید\n"
-        "/list_saved\n\n"
-        "🎯 پیشنهاد شخصی با سوال‌وجواب:\n"
-        "/recommend_me\n\n"
-        "🤖 چت هوش مصنوعی:\n"
-        "• شروع از صفر: /ai سوال\n"
-        "• ادامه گفتگو: روی جواب AI ریپلای کن و پیام بده\n"
-        "• شروع اجباری مکالمه جدید: /ai_new سوال\n"
-        "• وضعیت مصرف گروه: /ai_usage\n\n"
-        "🧠 خلاصه‌ساز متن:\n"
-        "• روی پیام طولانی ریپلای کن: /summarize\n"
-        "• یا مستقیم: /summarize متن\n\n"
-        "• موتور خلاصه‌سازی: داخلی (بدون API)\n\n"
-        "🧪 راستی‌آزمایی خبر:\n"
-        "• روی پیام خبر ریپلای کن: /factcheck\n"
-        "• یا مستقیم: /factcheck متن خبر\n\n"
-        "• نسخه پیشرفته سندمحور: /fact_pro\n\n"
-        "🎬 پیشنهاد روزانه:\n"
-        "• از دکمه «🎬 پیشنهاد روزانه» پنل کامل را باز کن (بدون کامند)\n"
-        "• نوع ارسال: فیلم/سریال/کتاب (هرکدام جدا روشن/خاموش)\n"
-        "/reco_on | /reco_off\n"
-        "/set_reco_time 21:30\n"
-        "/send_reco_now\n\n"
-        "⚙️ تنظیمات گروه (فقط ادمین):\n"
-        "/group_settings\n"
+        "/list_saved\n"
+        "/save_msg (روی پیام ریپلای)\n"
+        "/get_msg کلید\n"
+        "/list_msgs\n"
+        "/del_msg کلید\n\n"
+        "📡 فوروارد هوشمند کانال (گروه):\n"
+        "/fw_on | /fw_off\n"
+        "/fw_add_channel @channel یا -100...\n"
+        "/fw_del_channel @channel\n"
+        "/fw_add_keyword عبارت\n"
+        "/fw_del_keyword عبارت\n"
+        "/fw_list\n\n"
+        "⚙️ تنظیمات گروه (ادمین):\n"
+        "/group_menu | /group_settings\n"
         "/group_on | /group_off\n"
         "/set_group_cmd !yourcmd\n"
         "/auto_on | /auto_off\n"
@@ -3478,7 +3563,11 @@ def help_text() -> str:
         "/toggle_pin\n"
         "/toggle_mention\n"
         "/send_now\n"
-        "/group_reset"
+        "/group_reset\n\n"
+        "🛡 دستورات صاحب بات:\n"
+        "/owner_panel\n"
+        "/set_gpt on|off\n"
+        "/set_gpt_limit عدد"
     )
 
 
@@ -3511,9 +3600,9 @@ def full_guide_text(is_group: bool = False) -> str:
         "• یا مستقیم: /summarize متن\n"
         "• خلاصه‌سازی کاملا با موتور داخلی خود ربات انجام می‌شود (بدون API).\n\n"
         "4) راستی‌آزمایی خبر\n"
-        "• روی خبر ریپلای کن: /factcheck\n"
-        "• یا مستقیم: /factcheck متن خبر\n"
-        "• نسخه پیشرفته: /fact_pro (تحلیل جزءبه‌جزء + منابع شماره‌دار)\n"
+        "• حالت اخبار (پایگاه گسترده 50 جهانی + 10 داخلی): /fact_news یا /factcheck\n"
+        "• حالت خیلی خلاصه: /cred_short\n"
+        "• حالت پیشرفته AI + تحلیل جزءبه‌جزء + منابع شماره‌دار: /fact_pro\n"
         "• خروجی: درصد احتمال واقعی/فیک + منابع شاخص + جمع‌بندی\n\n"
         "5) خرج و دنگ گروهی\n"
         "• ثبت خرج: /add 480 پیتزا\n"
@@ -3545,7 +3634,7 @@ def full_guide_text(is_group: bool = False) -> str:
         "مثال‌های سریع\n"
         "• /ai یه تحلیل کوتاه از وضعیت دلار بده\n"
         "• /summarize (روی یک پیام طولانی ریپلای)\n"
-        "• /factcheck (روی یک خبر ریپلای)\n"
+        "• /fact_news (روی یک خبر ریپلای)\n"
         "• /add 260000 تاکسی"
     )
 
@@ -5175,7 +5264,7 @@ def _extract_factcheck_input_text(message) -> str:
     return ""
 
 
-@bot.message_handler(commands=["factcheck", "verify_news", "newscheck"])
+@bot.message_handler(commands=["factcheck", "verify_news", "newscheck", "fact_news"])
 def factcheck_news(message):
     track_message_context(message, action="factcheck_command")
     if is_group_chat(message) and not is_for_this_bot(_command_head(message)):
@@ -5185,20 +5274,55 @@ def factcheck_news(message):
     if not source_text:
         bot.reply_to(
             message,
-            "برای راستی‌آزمایی:\n"
-            "1) روی پیام خبر ریپلای کن و /factcheck بزن\n"
-            "2) یا مستقیم بنویس: /factcheck متن خبر",
+            "برای فکت‌سنجی اخبار:\n"
+            "1) روی پیام خبر ریپلای کن و /fact_news بزن\n"
+            "2) یا مستقیم بنویس: /fact_news متن خبر",
         )
         return
 
     status = bot.reply_to(
         message,
-        "🔎 در حال بررسی خبر...\n"
-        "• جمع‌آوری از منابع داخلی/خارجی\n"
+        "🔎 در حال فکت‌سنجی اخبار...\n"
+        "• بررسی گسترده در 50 منبع جهانی + 10 منبع داخلی\n"
         "• جست‌وجو در Google/Bing News RSS\n"
-        "• امتیازدهی موافق/مخالف و جمع‌بندی",
+        "• امتیازدهی موافق/مخالف و جمع‌بندی سندمحور",
     )
-    result = run_news_factcheck(source_text)
+    result = run_news_factcheck(source_text, mode="news")
+    report = build_factcheck_report(result)
+    try:
+        bot.edit_message_text(
+            report,
+            chat_id=status.chat.id,
+            message_id=status.message_id,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        bot.reply_to(message, report, disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=["cred_short", "verify_short", "check_short"])
+def factcheck_news_brief(message):
+    track_message_context(message, action="factcheck_brief_command")
+    if is_group_chat(message) and not is_for_this_bot(_command_head(message)):
+        return
+
+    source_text = _extract_factcheck_input_text(message)
+    if not source_text:
+        bot.reply_to(
+            message,
+            "برای اعتبارسنجی خیلی خلاصه:\n"
+            "1) روی پیام ریپلای کن و /cred_short بزن\n"
+            "2) یا مستقیم بنویس: /cred_short متن ادعا/خبر",
+        )
+        return
+
+    status = bot.reply_to(
+        message,
+        "⚡️ اعتبارسنجی خیلی خلاصه در حال انجام است...\n"
+        "• نتیجه سریع\n"
+        "• منابع کلیدی محدود",
+    )
+    result = run_news_factcheck(source_text, mode="brief")
     report = build_factcheck_report(result)
     try:
         bot.edit_message_text(
@@ -5230,11 +5354,11 @@ def factcheck_news_pro(message):
     status = bot.reply_to(
         message,
         "🧪 در حال راستی‌آزمایی پیشرفته...\n"
-        "• تحلیل خبر با هوش مصنوعی\n"
+        "• تحلیل خبر با هوش مصنوعی + مدل‌سازی شواهد\n"
         "• استخراج فکت‌های جزئی و تناقض‌ها\n"
-        "• ارائه سند و لینک منبع",
+        "• ارائه سند، لینک و استدلال جزءبه‌جزء",
     )
-    result = run_news_factcheck(source_text)
+    result = run_news_factcheck(source_text, mode="pro")
     report = build_factcheck_report(result)
     try:
         bot.edit_message_text(
