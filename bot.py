@@ -2887,6 +2887,66 @@ def _extract_sensitive_facts(text: str) -> list[str]:
     return out[:3]
 
 
+def _dedupe_summary_points(summary: str, points: list[str]) -> list[str]:
+    out: list[str] = []
+    for p in points:
+        pp = (p or "").strip()
+        if not pp:
+            continue
+        if _text_similarity(summary, pp) >= 0.74:
+            continue
+        if any(_text_similarity(pp, existing) >= 0.86 for existing in out):
+            continue
+        out.append(pp)
+    return out
+
+
+def _render_summary_sections(
+    summary: str,
+    points: list[str],
+    key_terms: list[str],
+    sensitive_facts: list[str],
+    source_len: int,
+) -> str:
+    compact_mode = source_len < 620 and not sensitive_facts
+    points_cap = 2 if compact_mode else (3 if source_len < 1000 else 4)
+    points = _dedupe_summary_points(summary, points)[:points_cap]
+    show_keywords = bool(key_terms) and not compact_mode and source_len >= 520
+
+    # Keep total output shorter than input (with safety margin).
+    budget = max(180, int(source_len * 0.72))
+    if source_len < 360:
+        budget = max(130, int(source_len * 0.65))
+
+    while True:
+        lines = ["📝 خلاصه", summary.strip()]
+        if points:
+            lines += ["", "🔹 نکات کلیدی"]
+            lines.extend([f"• {p}" for p in points])
+        if sensitive_facts:
+            lines += ["", "📎 فکت‌های مهم"]
+            lines.extend([f"• {f}" for f in sensitive_facts[:3]])
+        if show_keywords and key_terms:
+            lines += ["", "🏷 کلیدواژه‌ها: " + " | ".join(key_terms[:5])]
+        body = "\n".join(lines).strip()
+        if len(body) <= budget:
+            return body
+
+        if show_keywords:
+            show_keywords = False
+            continue
+        if len(points) > 1:
+            points = points[:-1]
+            continue
+        # Last-resort tightening: aggressively shrink summary sentence.
+        tighter = max(90, min(200, int(budget * 0.52)))
+        new_summary = _shrink_clause(summary, max_chars=tighter)
+        if new_summary == summary:
+            safe_summary = _shrink_clause(summary, max_chars=max(80, min(180, int(budget * 0.60))))
+            return "\n".join(["📝 خلاصه", safe_summary]).strip()
+        summary = new_summary
+
+
 def _normalize_score_map(scores: dict[int, float]) -> dict[int, float]:
     if not scores:
         return {}
@@ -3076,19 +3136,13 @@ def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int
         if len(k) >= 3 and v >= 1 and k not in SUMMARIZER_EXTRA_STOPWORDS and k not in stopwords
     ][:5]
     sensitive_facts = _extract_sensitive_facts(source)
-
-    lines = ["📝 خلاصه", summary, "", "🔹 نکات کلیدی"]
-    for p in points:
-        lines.append(f"• {p}")
-    if sensitive_facts:
-        lines.append("")
-        lines.append("📎 فکت‌های مهم")
-        for fact in sensitive_facts:
-            lines.append(f"• {fact}")
-    if key_terms:
-        lines.append("")
-        lines.append("🏷 کلیدواژه‌ها: " + " | ".join(key_terms))
-    return "\n".join(lines).strip()
+    return _render_summary_sections(
+        summary=summary,
+        points=points,
+        key_terms=key_terms,
+        sensitive_facts=sensitive_facts,
+        source_len=len(source),
+    )
 
 
 def _extract_summarize_input_text(message) -> str:
