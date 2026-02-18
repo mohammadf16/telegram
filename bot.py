@@ -22,6 +22,14 @@ import requests
 import telebot
 from bs4 import BeautifulSoup
 from telebot import types
+try:
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import PromptTemplate
+    from langchain_openai import ChatOpenAI
+except Exception:
+    StrOutputParser = None
+    PromptTemplate = None
+    ChatOpenAI = None
 
 app = Flask(__name__)
 
@@ -49,6 +57,11 @@ OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano").strip()
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").strip().rstrip("/")
+LANGCHAIN_ENABLED = os.getenv("LANGCHAIN_ENABLED", "1").strip().lower() in ("1", "true", "on", "yes")
+AI_CACHE_ENABLED = os.getenv("AI_CACHE_ENABLED", "1").strip().lower() in ("1", "true", "on", "yes")
+AI_CACHE_TTL_SEC = max(60, int(os.getenv("AI_CACHE_TTL_SEC", "21600")))
+AI_CACHE_MAX_ITEMS = max(50, int(os.getenv("AI_CACHE_MAX_ITEMS", "600")))
+AI_PROMPT_MAX_CHARS = max(1000, int(os.getenv("AI_PROMPT_MAX_CHARS", "7000")))
 DEBUG_SAVE_MSG = os.getenv("DEBUG_SAVE_MSG", "1").strip() in ("1", "true", "on", "yes")
 AI_DEBUG = os.getenv("AI_DEBUG", "1").strip().lower() in ("1", "true", "on", "yes")
 RUN_MODE = os.getenv(
@@ -417,6 +430,10 @@ REMINDER_DRAFT_COUNTER = 0
 AI_THREADS: dict[str, list[dict[str, str]]] = {}
 AI_MESSAGE_TO_THREAD: dict[str, str] = {}
 AI_LAST_THREAD_BY_CHAT: dict[str, str] = {}
+AI_CACHE_LOCK = threading.Lock()
+AI_RESPONSE_CACHE: dict[str, tuple[int, str]] = {}
+LANGCHAIN_CLIENT: Any = None
+LANGCHAIN_AVAILABLE = bool(ChatOpenAI and PromptTemplate and StrOutputParser)
 NEWS_LOCK = threading.Lock()
 NEWS_LAST_REFRESH_TS = 0
 NEWS_FEED_CURSOR = 0
@@ -3043,6 +3060,101 @@ def maybe_send_daily_recommendations() -> None:
             print(f"Daily recommendation error for {chat_id}: {exc}")
 
 
+def _normalize_ai_prompt(prompt: str) -> str:
+    text = (prompt or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = text.strip()
+    if len(text) > AI_PROMPT_MAX_CHARS:
+        return text[:AI_PROMPT_MAX_CHARS].rstrip()
+    return text
+
+
+def _ai_cache_key(
+    prompt: str,
+    max_output_tokens: int,
+    reasoning_effort: str | None = None,
+    tools_mode: str = "none",
+) -> str:
+    payload = "|".join(
+        [
+            OPENAI_MODEL,
+            OPENAI_API_BASE,
+            str(max_output_tokens),
+            normalize_text(reasoning_effort or ""),
+            tools_mode,
+            _normalize_ai_prompt(prompt),
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _ai_cache_get(key: str) -> str:
+    if not AI_CACHE_ENABLED:
+        return ""
+    now_ts = int(time.time())
+    with AI_CACHE_LOCK:
+        row = AI_RESPONSE_CACHE.get(key)
+        if not row:
+            return ""
+        expire_ts, value = row
+        if expire_ts < now_ts:
+            AI_RESPONSE_CACHE.pop(key, None)
+            return ""
+        return value
+
+
+def _ai_cache_put(key: str, value: str) -> None:
+    if not AI_CACHE_ENABLED or not value.strip():
+        return
+    now_ts = int(time.time())
+    exp = now_ts + AI_CACHE_TTL_SEC
+    with AI_CACHE_LOCK:
+        AI_RESPONSE_CACHE[key] = (exp, value)
+        if len(AI_RESPONSE_CACHE) <= AI_CACHE_MAX_ITEMS:
+            return
+        # Remove oldest entries first.
+        old_items = sorted(AI_RESPONSE_CACHE.items(), key=lambda kv: kv[1][0])[: max(1, AI_CACHE_MAX_ITEMS // 6)]
+        for k, _ in old_items:
+            AI_RESPONSE_CACHE.pop(k, None)
+
+
+def _get_langchain_client() -> Any:
+    global LANGCHAIN_CLIENT
+    if LANGCHAIN_CLIENT is not None:
+        return LANGCHAIN_CLIENT
+    if not LANGCHAIN_AVAILABLE or not LANGCHAIN_ENABLED or not OPENAI_API_KEY:
+        return None
+    try:
+        LANGCHAIN_CLIENT = ChatOpenAI(
+            model=OPENAI_MODEL,
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_API_BASE,
+            temperature=0,
+            timeout=25,
+        )
+        return LANGCHAIN_CLIENT
+    except Exception as exc:
+        log_ai_debug(f"LangChain init failed: {exc}")
+        LANGCHAIN_CLIENT = None
+        return None
+
+
+def _call_recommendation_model_langchain(prompt: str, max_output_tokens: int) -> str:
+    llm = _get_langchain_client()
+    if llm is None or PromptTemplate is None or StrOutputParser is None:
+        return ""
+    try:
+        prompt_tmpl = PromptTemplate.from_template("{input}")
+        chain = prompt_tmpl | llm.bind(max_tokens=max_output_tokens) | StrOutputParser()
+        out = chain.invoke({"input": prompt})
+        if isinstance(out, str):
+            return out.strip()
+    except Exception as exc:
+        log_ai_debug(f"LangChain invoke failed: {exc}")
+    return ""
+
+
 def call_recommendation_model(
     prompt: str,
     max_output_tokens: int = 300,
@@ -3051,11 +3163,23 @@ def call_recommendation_model(
     if not OPENAI_API_KEY:
         log_ai_debug("OPENAI_API_KEY is empty; skipping model call.")
         return ""
+    clean_prompt = _normalize_ai_prompt(prompt)
+    cache_key = _ai_cache_key(clean_prompt, max_output_tokens=max_output_tokens, reasoning_effort=reasoning_effort)
+    cached = _ai_cache_get(cache_key)
+    if cached:
+        return cached
+
+    # For normal text generation/classification flows, use LangChain pipeline first.
+    lc_out = _call_recommendation_model_langchain(clean_prompt, max_output_tokens=max_output_tokens)
+    if lc_out:
+        _ai_cache_put(cache_key, lc_out)
+        return lc_out
+
     url = f"{OPENAI_API_BASE}/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": OPENAI_MODEL,
-        "input": prompt,
+        "input": clean_prompt,
         "max_output_tokens": max_output_tokens,
     }
     if reasoning_effort:
@@ -3066,29 +3190,10 @@ def call_recommendation_model(
             log_ai_debug(f"OpenAI API HTTP {res.status_code}: {res.text[:500]}")
             return ""
         data = res.json()
-        text = data.get("output_text")
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-
-        # Fallback parser for Responses API shapes where output_text is absent.
-        output = data.get("output")
-        if isinstance(output, list):
-            chunks: list[str] = []
-            for item in output:
-                if not isinstance(item, dict):
-                    continue
-                content = item.get("content")
-                if not isinstance(content, list):
-                    continue
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    # Seen variants: {"type":"output_text","text":"..."} or {"type":"text","text":"..."}
-                    part_text = part.get("text")
-                    if isinstance(part_text, str) and part_text.strip():
-                        chunks.append(part_text.strip())
-            if chunks:
-                return "\n".join(chunks).strip()
+        out_text = _extract_responses_output_text(data)
+        if out_text:
+            _ai_cache_put(cache_key, out_text)
+            return out_text
 
         status = data.get("status")
         err = data.get("error")
@@ -3153,10 +3258,9 @@ def _ai_factcheck_web_verdict(claim: str, translated_claim: str = "") -> dict[st
         return {}
     translated = " ".join((translated_claim or "").split()).strip()[:520]
     prompt = (
-        "You are a strict, evidence-first fact-check analyst.\n"
-        "Use web search tool to find recent, credible sources.\n"
-        "Never output a claim without citation URLs.\n"
-        "Return ONLY JSON object with this exact shape:\n"
+        "Strict evidence-first fact-check.\n"
+        "Use web_search tool, cite URLs, no speculation.\n"
+        "Return ONLY JSON with shape:\n"
         "{"
         "\"verdict\":\"likely_true|likely_false|uncertain\","
         "\"truth_prob\":0-100,"
@@ -3168,45 +3272,66 @@ def _ai_factcheck_web_verdict(claim: str, translated_claim: str = "") -> dict[st
         "\"date\":\"YYYY-MM-DD or unknown\",\"stance\":\"support|refute|related\",\"note\":\"short Persian\"}"
         "]"
         "}\n"
-        "Rules:\n"
-        "- Minimum 2 and maximum 8 sources.\n"
-        "- Prefer official outlets and primary reporting.\n"
-        "- If sources conflict, set verdict=uncertain.\n"
-        "- If evidence is weak, lower confidence.\n"
-        "- truth_prob and confidence must be integers.\n\n"
+        "Rules: 2-8 sources; prefer official/primary outlets; conflicts=>uncertain; weak evidence=>low confidence.\n\n"
         f"Claim (original): {source_claim}\n"
         f"Claim (translation): {translated if translated else 'N/A'}"
     )
+    prompt = _normalize_ai_prompt(prompt)
+    cache_key = _ai_cache_key(
+        prompt,
+        max_output_tokens=1200,
+        reasoning_effort="medium",
+        tools_mode="web_search",
+    )
+    cached_raw = _ai_cache_get(cache_key)
+    if cached_raw:
+        payload_txt = _extract_json_payload(cached_raw)
+        if payload_txt:
+            try:
+                parsed_cached = json.loads(payload_txt)
+                if isinstance(parsed_cached, dict):
+                    parsed = parsed_cached
+                else:
+                    parsed = None
+            except Exception:
+                parsed = None
+        else:
+            parsed = None
+    else:
+        parsed = None
 
-    url = f"{OPENAI_API_BASE}/responses"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload: dict[str, Any] = {
-        "model": OPENAI_MODEL,
-        "input": prompt,
-        "max_output_tokens": 1200,
-        "reasoning": {"effort": "medium"},
-        "tools": [{"type": "web_search_preview"}],
-    }
-    try:
-        res = requests.post(url, headers=headers, json=payload, timeout=45)
-        if res.status_code >= 400:
-            log_ai_debug(f"OpenAI factcheck web HTTP {res.status_code}: {res.text[:500]}")
+    if parsed is None:
+        url = f"{OPENAI_API_BASE}/responses"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        payload: dict[str, Any] = {
+            "model": OPENAI_MODEL,
+            "input": prompt,
+            "max_output_tokens": 1200,
+            "reasoning": {"effort": "medium"},
+            "tools": [{"type": "web_search_preview"}],
+        }
+        try:
+            res = requests.post(url, headers=headers, json=payload, timeout=45)
+            if res.status_code >= 400:
+                log_ai_debug(f"OpenAI factcheck web HTTP {res.status_code}: {res.text[:500]}")
+                return {}
+            data = res.json()
+        except Exception as exc:
+            log_ai_debug(f"OpenAI factcheck web error: {exc}")
             return {}
-        data = res.json()
-    except Exception as exc:
-        log_ai_debug(f"OpenAI factcheck web error: {exc}")
-        return {}
 
-    raw = _extract_responses_output_text(data)
-    payload_txt = _extract_json_payload(raw)
-    if not payload_txt:
-        return {}
-    try:
-        parsed = json.loads(payload_txt)
-    except Exception:
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
+        raw = _extract_responses_output_text(data)
+        if raw:
+            _ai_cache_put(cache_key, raw)
+        payload_txt = _extract_json_payload(raw)
+        if not payload_txt:
+            return {}
+        try:
+            parsed = json.loads(payload_txt)
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
 
     verdict = normalize_text(str(parsed.get("verdict", "uncertain")))
     if verdict not in ("likely_true", "likely_false", "uncertain"):
@@ -3354,9 +3479,9 @@ def call_ai_chat_model(messages: list[dict[str, str]], max_output_tokens: int | 
 
 SUMMARIZER_MAX_INPUT_CHARS = max(1500, int(os.getenv("SUMMARIZER_MAX_INPUT_CHARS", "12000")))
 SUMMARIZER_MAX_OUTPUT_CHARS = max(700, int(os.getenv("SUMMARIZER_MAX_OUTPUT_CHARS", "1900")))
-SUMMARIZER_TARGET_RATIO = min(0.40, max(0.12, float(os.getenv("SUMMARIZER_TARGET_RATIO", "0.24"))))
-SUMMARIZER_MIN_TARGET_CHARS = max(120, int(os.getenv("SUMMARIZER_MIN_TARGET_CHARS", "190")))
-SUMMARIZER_MAX_TARGET_CHARS = max(260, int(os.getenv("SUMMARIZER_MAX_TARGET_CHARS", "520")))
+SUMMARIZER_TARGET_RATIO = min(0.34, max(0.10, float(os.getenv("SUMMARIZER_TARGET_RATIO", "0.18"))))
+SUMMARIZER_MIN_TARGET_CHARS = max(100, int(os.getenv("SUMMARIZER_MIN_TARGET_CHARS", "150")))
+SUMMARIZER_MAX_TARGET_CHARS = max(200, int(os.getenv("SUMMARIZER_MAX_TARGET_CHARS", "360")))
 SUMMARIZER_EXTRA_STOPWORDS = {
     "اون",
     "خیلی",
@@ -3542,6 +3667,59 @@ def _extract_sensitive_facts(text: str) -> list[str]:
     return out[:3]
 
 
+def _is_probable_financial_scam_text(text: str) -> bool:
+    s = normalize_fa_text(text or "")
+    if not s:
+        return False
+    flags = 0
+    if re.search(r"[\w\.-]+@[\w\.-]+\.\w{2,}", s):
+        flags += 1
+    if re.search(r"\b(وارث|ارث|حساب|بانک|سپرده|تراکنش|مدیر عامل|ceo)\b", s):
+        flags += 1
+    if re.search(r"\b(محرمانه|محرمانگی|مخفی|فوری)\b", s):
+        flags += 1
+    if re.search(r"\b(دلار|یورو|usd|eur|٪|%)\b", s):
+        flags += 1
+    if re.search(r"\b(تقسیم|پنجاه|50|۵۰)\b", s):
+        flags += 1
+    if re.search(r"\b(پاسخ|ایمیل بزنید|همکاری|درخواست)\b", s):
+        flags += 1
+    return flags >= 3
+
+
+def _build_scam_focused_summary(source: str, sensitive_facts: list[str]) -> str:
+    mail = ""
+    m = re.search(r"[\w\.-]+@[\w\.-]+\.\w{2,}", source)
+    if m:
+        mail = m.group(0).strip()
+    amount = ""
+    m2 = re.search(
+        r"((?:\d[\d,\.]*|[۰-۹][۰-۹,\.]*)\s*(?:دلار|یورو|تومان|ریال|usd|eur))",
+        source,
+        flags=re.IGNORECASE,
+    )
+    if m2:
+        amount = m2.group(1).strip()
+    lines = [
+        "📝 خلاصه",
+        "این متن یک سناریوی رایج کلاهبرداری مالی/ارث است: فرستنده با ادعای مدیر بانکی بودن، وجود حساب راکد و "
+        "انتقال پول کلان، از مخاطب می‌خواهد به‌عنوان وارث همکاری کند و بخشی از مبلغ را بگیرد.",
+        "",
+        "🔹 نکات کلیدی",
+        "• ادعای مقام بانکی + درخواست محرمانگی + وعده سود بالا، الگوی کلاسیک اسکم است.",
+        "• هدف پیام، کشاندن مخاطب به ادامه تماس و دریافت اطلاعات/اقدام مالی است.",
+    ]
+    if mail:
+        lines.append(f"• مسیر تماس در متن: {mail}")
+    if amount:
+        lines.append(f"• مبلغ ادعایی: {amount}")
+    if sensitive_facts:
+        lines += ["", "📎 فکت‌های مهم"]
+        for f in sensitive_facts[:2]:
+            lines.append(f"• {f}")
+    return "\n".join(lines).strip()
+
+
 def _dedupe_summary_points(summary: str, points: list[str]) -> list[str]:
     out: list[str] = []
     for p in points:
@@ -3563,15 +3741,15 @@ def _render_summary_sections(
     sensitive_facts: list[str],
     source_len: int,
 ) -> str:
-    compact_mode = source_len < 620 and not sensitive_facts
-    points_cap = 2 if compact_mode else (3 if source_len < 1000 else 4)
+    compact_mode = source_len < 720 and not sensitive_facts
+    points_cap = 2 if compact_mode else 3
     points = _dedupe_summary_points(summary, points)[:points_cap]
-    show_keywords = bool(key_terms) and not compact_mode and source_len >= 520
+    show_keywords = bool(key_terms) and not compact_mode and source_len >= 900
 
     # Keep total output shorter than input (with safety margin).
-    budget = max(180, int(source_len * 0.72))
+    budget = max(140, int(source_len * 0.50))
     if source_len < 360:
-        budget = max(130, int(source_len * 0.65))
+        budget = max(110, int(source_len * 0.60))
 
     while True:
         lines = ["📝 خلاصه", summary.strip()]
@@ -3594,10 +3772,10 @@ def _render_summary_sections(
             points = points[:-1]
             continue
         # Last-resort tightening: aggressively shrink summary sentence.
-        tighter = max(90, min(200, int(budget * 0.52)))
+        tighter = max(80, min(170, int(budget * 0.48)))
         new_summary = _shrink_clause(summary, max_chars=tighter)
         if new_summary == summary:
-            safe_summary = _shrink_clause(summary, max_chars=max(80, min(180, int(budget * 0.60))))
+            safe_summary = _shrink_clause(summary, max_chars=max(72, min(150, int(budget * 0.55))))
             return "\n".join(["📝 خلاصه", safe_summary]).strip()
         summary = new_summary
 
@@ -3696,7 +3874,7 @@ def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int
         return f"خلاصه:\n{clipped}"
 
     if len(sentences) == 1:
-        single = _shrink_clause(sentences[0], max_chars=220)
+        single = _shrink_clause(sentences[0], max_chars=170)
         return f"📝 خلاصه\n{single}\n\n🔹 نکات کلیدی\n• {single}"
 
     lang = _guess_news_lang(source)
@@ -3741,9 +3919,9 @@ def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int
         )
 
     if len(sentences) >= 8:
-        keep_n = min(max_sentences, 5)
-    else:
         keep_n = min(max_sentences, 4)
+    else:
+        keep_n = min(max_sentences, 3)
     keep_n = max(2, keep_n)
 
     target_chars = int(len(source) * SUMMARIZER_TARGET_RATIO)
@@ -3755,33 +3933,32 @@ def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int
         keep_cap=keep_n,
     )
     if list_like:
-        for idx in list_like[:3]:
+        for idx in list_like[:2]:
             if idx in ordered_idx:
                 continue
-            if len(ordered_idx) < keep_n + 1:
+            if len(ordered_idx) < keep_n:
                 ordered_idx.append(idx)
         ordered_idx = sorted(set(ordered_idx))
-    if question_like and not any(i in ordered_idx for i in question_like):
+    if question_like and not any(i in ordered_idx for i in question_like) and len(ordered_idx) < keep_n:
         qidx = question_like[0]
-        if len(ordered_idx) < keep_n + 1:
-            ordered_idx.append(qidx)
-            ordered_idx = sorted(set(ordered_idx))
+        ordered_idx.append(qidx)
+        ordered_idx = sorted(set(ordered_idx))
     # Preserve at least one highly-signaled factual sentence.
     if signal_scores:
         top_signal = sorted(signal_scores.keys(), key=lambda i: signal_scores.get(i, 0.0), reverse=True)
-        for idx in top_signal[:2]:
+        for idx in top_signal[:1]:
             if signal_scores.get(idx, 0.0) < 0.22:
                 continue
-            if idx not in ordered_idx and len(ordered_idx) < keep_n + 1:
+            if idx not in ordered_idx and len(ordered_idx) < keep_n:
                 ordered_idx.append(idx)
         ordered_idx = sorted(set(ordered_idx))
 
-    summary_chunks = [_shrink_clause(sentences[i], max_chars=122) for i in ordered_idx[:5]]
+    summary_chunks = [_shrink_clause(sentences[i], max_chars=92) for i in ordered_idx[:3]]
     summary = " ".join([c for c in summary_chunks if c]).strip()
-    summary = summary[: max(220, target_chars + 80)].rstrip()
+    summary = summary[: max(160, target_chars + 28)].rstrip()
 
     point_limit = min(max_points, len(ordered_idx))
-    points = [_shrink_clause(sentences[i], max_chars=118) for i in ordered_idx[:point_limit]]
+    points = [_shrink_clause(sentences[i], max_chars=88) for i in ordered_idx[: min(point_limit, 3)]]
     selected_freq: Counter[str] = Counter()
     for i in ordered_idx:
         selected_freq.update(sent_tokens[i])
@@ -3791,6 +3968,8 @@ def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int
         if len(k) >= 3 and v >= 1 and k not in SUMMARIZER_EXTRA_STOPWORDS and k not in stopwords
     ][:5]
     sensitive_facts = _extract_sensitive_facts(source)
+    if _is_probable_financial_scam_text(source):
+        return _build_scam_focused_summary(source, sensitive_facts)
     return _render_summary_sections(
         summary=summary,
         points=points,
