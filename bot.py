@@ -9,8 +9,13 @@ import threading
 import time
 import html
 import random
+from collections import Counter
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
+from math import exp
 from typing import Any
+from urllib.parse import quote_plus, urlparse
 
 from flask import Flask, request
 import requests
@@ -121,6 +126,153 @@ MARKET_CRYPTO_MAP = {
     "crypto-ethereum": "اتریوم",
 }
 
+NEWS_HTTP_TIMEOUT = max(3, int(os.getenv("NEWS_HTTP_TIMEOUT", "6")))
+NEWS_REFRESH_INTERVAL_MIN = max(10, int(os.getenv("NEWS_REFRESH_INTERVAL_MIN", "60")))
+NEWS_REFRESH_BUDGET_SEC = max(8, int(os.getenv("NEWS_REFRESH_BUDGET_SEC", "20")))
+FACTCHECK_QUERY_MAX = max(1, min(4, int(os.getenv("FACTCHECK_QUERY_MAX", "3"))))
+FACTCHECK_MAX_EVIDENCE = max(4, min(12, int(os.getenv("FACTCHECK_MAX_EVIDENCE", "8"))))
+NEWS_INDEX_KEEP_DAYS = max(7, int(os.getenv("NEWS_INDEX_KEEP_DAYS", "30")))
+
+NEWS_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    )
+}
+
+NEWS_SOURCE_FEEDS: list[dict[str, str]] = [
+    {"name": "IRNA", "url": "https://www.irna.ir/rss", "region": "ir", "lang": "fa", "tier": "high"},
+    {"name": "ISNA", "url": "https://www.isna.ir/rss", "region": "ir", "lang": "fa", "tier": "high"},
+    {"name": "Mehr News", "url": "https://www.mehrnews.com/rss", "region": "ir", "lang": "fa", "tier": "medium"},
+    {
+        "name": "Tasnim",
+        "url": "https://www.tasnimnews.com/fa/rss/feed/0/7/0/%D8%A2%D8%AE%D8%B1%DB%8C%D9%86-%D8%A7%D8%AE%D8%A8%D8%A7%D8%B1",
+        "region": "ir",
+        "lang": "fa",
+        "tier": "medium",
+    },
+    {"name": "Fars News", "url": "https://www.farsnews.ir/rss", "region": "ir", "lang": "fa", "tier": "medium"},
+    {"name": "ILNA", "url": "https://www.ilna.ir/fa/rss/allnews", "region": "ir", "lang": "fa", "tier": "medium"},
+    {"name": "Khabar Online", "url": "https://www.khabaronline.ir/rss", "region": "ir", "lang": "fa", "tier": "medium"},
+    {"name": "Hamshahri", "url": "https://www.hamshahrionline.ir/rss", "region": "ir", "lang": "fa", "tier": "medium"},
+    {"name": "YJC", "url": "https://www.yjc.news/fa/rss/allnews", "region": "ir", "lang": "fa", "tier": "medium"},
+    {"name": "Tabnak", "url": "https://www.tabnak.ir/fa/rss/allnews", "region": "ir", "lang": "fa", "tier": "medium"},
+    {"name": "Asr Iran", "url": "https://www.asriran.com/fa/rss/allnews", "region": "ir", "lang": "fa", "tier": "medium"},
+    {"name": "BBC", "url": "http://feeds.bbci.co.uk/news/world/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "CNN", "url": "http://rss.cnn.com/rss/edition.rss", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "Reuters", "url": "https://feeds.reuters.com/reuters/worldNews", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "The Guardian", "url": "https://www.theguardian.com/world/rss", "region": "intl", "lang": "en", "tier": "high"},
+    {
+        "name": "NYTimes",
+        "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "region": "intl",
+        "lang": "en",
+        "tier": "high",
+    },
+    {"name": "Al Jazeera", "url": "https://www.aljazeera.com/xml/rss/all.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "DW", "url": "https://rss.dw.com/xml/rss-en-all", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "France24", "url": "https://www.france24.com/en/rss", "region": "intl", "lang": "en", "tier": "medium"},
+    {"name": "NPR", "url": "https://feeds.npr.org/1004/rss.xml", "region": "intl", "lang": "en", "tier": "high"},
+    {"name": "AP", "url": "https://rsshub.app/apnews/topics/apf-topnews", "region": "intl", "lang": "en", "tier": "medium"},
+]
+
+SOURCE_TIER_NAME_HINTS = {
+    "reuters": "high",
+    "associated press": "high",
+    "ap news": "high",
+    "bbc": "high",
+    "irna": "high",
+    "isna": "high",
+    "the guardian": "high",
+    "nytimes": "high",
+    "new york times": "high",
+    "al jazeera": "high",
+    "dw": "high",
+    "npr": "high",
+    "cnn": "medium",
+    "tasnim": "medium",
+    "fars": "medium",
+    "mehr": "medium",
+    "ilna": "medium",
+    "khabar online": "medium",
+    "hamshahri": "medium",
+    "yjc": "medium",
+    "tabnak": "medium",
+    "asr iran": "medium",
+}
+
+SOURCE_TIER_WEIGHTS = {"high": 1.0, "medium": 0.78, "low": 0.55}
+FACT_LABEL_WEIGHTS = {"support": 1.0, "refute": -1.0, "related": 0.15, "irrelevant": 0.0}
+FACT_NEGATION_TERMS = (
+    "تکذیب",
+    "رد شد",
+    "شایعه",
+    "نادرست",
+    "دروغ",
+    "false",
+    "fake",
+    "hoax",
+    "not true",
+    "denied",
+    "rumor",
+)
+
+FACTCHECK_FA_STOPWORDS = {
+    "از",
+    "به",
+    "در",
+    "با",
+    "برای",
+    "که",
+    "این",
+    "آن",
+    "را",
+    "می",
+    "شود",
+    "شده",
+    "کرد",
+    "کرده",
+    "یک",
+    "بر",
+    "تا",
+    "یا",
+    "هم",
+    "اما",
+    "اگر",
+    "بود",
+    "است",
+    "نیست",
+    "و",
+}
+
+FACTCHECK_EN_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "with",
+    "from",
+    "at",
+    "by",
+    "about",
+    "that",
+    "this",
+    "it",
+    "as",
+}
+
 SETTINGS_LOCK = threading.Lock()
 TRIGGER_COOLDOWN_TS: dict[str, int] = {}
 BOT_USER_ID: int | None = None
@@ -131,6 +283,9 @@ REMINDER_DRAFT_COUNTER = 0
 AI_THREADS: dict[str, list[dict[str, str]]] = {}
 AI_MESSAGE_TO_THREAD: dict[str, str] = {}
 AI_LAST_THREAD_BY_CHAT: dict[str, str] = {}
+NEWS_LOCK = threading.Lock()
+NEWS_LAST_REFRESH_TS = 0
+DB_READY = False
 
 NEGATIVE_REPLY_KEYWORDS = ("کسشر شناسایی شد", "کسشر", "چرت بود", "مزخرف بود")
 POSITIVE_REPLY_KEYWORDS = ("شاهکار","جمله طلایی", "خفن بود", "عالی بود", "دمت گرم")
@@ -348,6 +503,7 @@ def save_global_settings() -> None:
 
 
 def init_database() -> None:
+    global DB_READY
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH)
         try:
@@ -427,9 +583,40 @@ def init_database() -> None:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS news_index (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    source_region TEXT,
+                    source_lang TEXT,
+                    source_tier TEXT,
+                    title TEXT NOT NULL,
+                    summary TEXT,
+                    link TEXT NOT NULL,
+                    published_ts INTEGER,
+                    normalized_title TEXT,
+                    fetched_at INTEGER,
+                    UNIQUE(source, link)
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_news_index_title ON news_index(normalized_title)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_news_index_published ON news_index(published_ts)"
+            )
             conn.commit()
         finally:
             conn.close()
+    DB_READY = True
+
+
+def ensure_database_ready() -> None:
+    if DB_READY:
+        return
+    init_database()
 
 
 def db_touch_user(user, chat_id: int | None = None, role: str = "member") -> None:
@@ -690,6 +877,888 @@ def db_delete_saved_group_message(chat_id: int, save_key: str) -> bool:
             return cur.rowcount > 0
         finally:
             conn.close()
+
+
+def _clean_html_text(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if "<" not in text and ">" not in text:
+        return " ".join(html.unescape(text).split())
+    try:
+        return " ".join(BeautifulSoup(text, "lxml").get_text(" ", strip=True).split())
+    except Exception:
+        return " ".join(re.sub(r"<[^>]+>", " ", text).split())
+
+
+def _guess_news_lang(text: str) -> str:
+    sample = (text or "").strip()
+    if not sample:
+        return "unknown"
+    fa_count = len(re.findall(r"[\u0600-\u06FF]", sample))
+    en_count = len(re.findall(r"[A-Za-z]", sample))
+    if fa_count > en_count:
+        return "fa"
+    if en_count > fa_count:
+        return "en"
+    return "unknown"
+
+
+def _infer_source_tier(source_name: str, fallback: str = "medium") -> str:
+    name = normalize_text(source_name)
+    for hint, tier in SOURCE_TIER_NAME_HINTS.items():
+        if hint in name:
+            return tier
+    return fallback if fallback in SOURCE_TIER_WEIGHTS else "medium"
+
+
+def _canonical_news_link(link: str) -> str:
+    value = (link or "").strip()
+    if not value:
+        return ""
+    if value.startswith("//"):
+        value = "https:" + value
+    if not value.startswith("http"):
+        return value
+    try:
+        parsed = urlparse(value)
+        cleaned = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+        if parsed.query and "news.google.com" not in parsed.netloc:
+            cleaned += "?" + parsed.query
+        return cleaned or value
+    except Exception:
+        return value
+
+
+def _parse_rss_datetime(value: str) -> int | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        pass
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        return int(datetime.fromisoformat(normalized).timestamp())
+    except Exception:
+        return None
+
+
+def _extract_feed_items(xml_text: str, source_meta: dict[str, str], max_items: int = 40) -> list[dict[str, Any]]:
+    if not xml_text.strip():
+        return []
+    try:
+        soup = BeautifulSoup(xml_text, "xml")
+    except Exception:
+        return []
+    nodes = soup.find_all(["item", "entry"])
+    out: list[dict[str, Any]] = []
+    now_ts = int(time.time())
+
+    def node_text(node_obj, tag_name: str) -> str:
+        tag = node_obj.find(tag_name)
+        if tag is None:
+            return ""
+        return tag.get_text(" ", strip=True)
+
+    for node in nodes[:max_items]:
+        title = _clean_html_text(node_text(node, "title"))
+        if not title:
+            continue
+
+        link = ""
+        link_tag = node.find("link")
+        if link_tag is not None:
+            href = (link_tag.get("href") or "").strip()
+            link = href or _clean_html_text(link_tag.get_text(" ", strip=True))
+        if not link:
+            link = _clean_html_text(node_text(node, "guid"))
+        if not link:
+            continue
+
+        summary = _clean_html_text(
+            node_text(node, "description")
+            or node_text(node, "summary")
+            or node_text(node, "content")
+        )
+        source_tag = node.find("source")
+        source_name = source_meta.get("name", "Unknown Source")
+        if source_tag is not None:
+            source_text = _clean_html_text(source_tag.get_text(" ", strip=True))
+            if source_text:
+                source_name = source_text
+
+        published_ts = (
+            _parse_rss_datetime(node_text(node, "pubDate"))
+            or _parse_rss_datetime(node_text(node, "updated"))
+            or _parse_rss_datetime(node_text(node, "published"))
+            or _parse_rss_datetime(node_text(node, "dc:date") or node_text(node, "date"))
+        )
+        source_tier = _infer_source_tier(source_name, source_meta.get("tier", "medium"))
+        out.append(
+            {
+                "source": source_name[:120],
+                "source_region": (source_meta.get("region") or "").strip()[:20],
+                "source_lang": (source_meta.get("lang") or "").strip()[:10],
+                "source_tier": source_tier,
+                "title": title[:600],
+                "summary": summary[:1500],
+                "link": _canonical_news_link(link)[:1200],
+                "published_ts": int(published_ts) if published_ts else None,
+                "normalized_title": normalize_fa_text(title)[:700],
+                "fetched_at": now_ts,
+            }
+        )
+    return out
+
+
+def _fetch_rss_items(feed_url: str, source_meta: dict[str, str], max_items: int = 40) -> list[dict[str, Any]]:
+    try:
+        res = requests.get(
+            feed_url,
+            headers=NEWS_REQUEST_HEADERS,
+            timeout=NEWS_HTTP_TIMEOUT,
+        )
+        if res.status_code >= 400:
+            return []
+        return _extract_feed_items(res.text, source_meta=source_meta, max_items=max_items)
+    except Exception:
+        return []
+
+
+def db_upsert_news_items(items: list[dict[str, Any]]) -> int:
+    ensure_database_ready()
+    if not items:
+        return 0
+    rows = []
+    for item in items:
+        source = str(item.get("source") or "").strip()
+        link = str(item.get("link") or "").strip()
+        title = str(item.get("title") or "").strip()
+        if not source or not link or not title:
+            continue
+        rows.append(
+            (
+                source,
+                str(item.get("source_region") or "")[:20],
+                str(item.get("source_lang") or "")[:10],
+                _infer_source_tier(str(item.get("source_tier") or ""), fallback="medium"),
+                title[:600],
+                str(item.get("summary") or "")[:1500],
+                link[:1200],
+                int(item["published_ts"]) if item.get("published_ts") else None,
+                normalize_fa_text(title)[:700],
+                int(item.get("fetched_at") or time.time()),
+            )
+        )
+    if not rows:
+        return 0
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.cursor()
+            cur.executemany(
+                """
+                INSERT INTO news_index
+                (source, source_region, source_lang, source_tier, title, summary, link, published_ts, normalized_title, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source, link) DO UPDATE SET
+                    source_region=excluded.source_region,
+                    source_lang=excluded.source_lang,
+                    source_tier=excluded.source_tier,
+                    title=excluded.title,
+                    summary=excluded.summary,
+                    published_ts=excluded.published_ts,
+                    normalized_title=excluded.normalized_title,
+                    fetched_at=excluded.fetched_at
+                """,
+                rows,
+            )
+            conn.commit()
+            return len(rows)
+        finally:
+            conn.close()
+
+
+def db_latest_news_fetch_ts() -> int:
+    ensure_database_ready()
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COALESCE(MAX(fetched_at), 0) FROM news_index")
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+
+def db_prune_news_index(keep_days: int = NEWS_INDEX_KEEP_DAYS) -> None:
+    ensure_database_ready()
+    cutoff = int(time.time()) - max(1, keep_days) * 86400
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                DELETE FROM news_index
+                WHERE COALESCE(published_ts, fetched_at, 0) < ?
+                """,
+                (cutoff,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def refresh_news_index(force: bool = False) -> dict[str, Any]:
+    global NEWS_LAST_REFRESH_TS
+    now_ts = int(time.time())
+    with NEWS_LOCK:
+        latest_ts = max(NEWS_LAST_REFRESH_TS, db_latest_news_fetch_ts())
+        min_gap_sec = NEWS_REFRESH_INTERVAL_MIN * 60
+        if not force and latest_ts > 0 and (now_ts - latest_ts) < min_gap_sec:
+            return {"refreshed": False, "inserted": 0, "feeds": 0}
+
+        start_ts = time.time()
+        total_inserted = 0
+        used_feeds = 0
+        for feed in NEWS_SOURCE_FEEDS:
+            if not force and (time.time() - start_ts) > NEWS_REFRESH_BUDGET_SEC:
+                break
+            items = _fetch_rss_items(feed.get("url", ""), source_meta=feed, max_items=35)
+            if items:
+                total_inserted += db_upsert_news_items(items)
+            used_feeds += 1
+        NEWS_LAST_REFRESH_TS = now_ts
+        db_prune_news_index()
+        return {"refreshed": True, "inserted": total_inserted, "feeds": used_feeds}
+
+
+def _news_query_feed_defs(query: str) -> list[dict[str, str]]:
+    q = quote_plus((query or "").strip())
+    if not q:
+        return []
+    return [
+        {
+            "url": f"https://news.google.com/rss/search?q={q}&hl=fa&gl=IR&ceid=IR:fa",
+            "name": "Google News",
+            "region": "mixed",
+            "lang": "fa",
+            "tier": "medium",
+        },
+        {
+            "url": f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en",
+            "name": "Google News",
+            "region": "mixed",
+            "lang": "en",
+            "tier": "medium",
+        },
+        {
+            "url": f"https://www.bing.com/news/search?q={q}&format=rss",
+            "name": "Bing News",
+            "region": "mixed",
+            "lang": "en",
+            "tier": "low",
+        },
+    ]
+
+
+def _fetch_query_news_items(query: str) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for feed in _news_query_feed_defs(query):
+        items = _fetch_rss_items(feed["url"], source_meta=feed, max_items=28)
+        if items:
+            merged.extend(items)
+    return merged
+
+
+def _tokenize_fact_text(text: str) -> list[str]:
+    if not text:
+        return []
+    return re.findall(r"[A-Za-z0-9\u0600-\u06FF]{2,}", normalize_fa_text(text))
+
+
+def _extract_fact_keywords(text: str, limit: int = 10) -> list[str]:
+    tokens = _tokenize_fact_text(text)
+    if not tokens:
+        return []
+    lang = _guess_news_lang(text)
+    stopwords = FACTCHECK_FA_STOPWORDS if lang == "fa" else FACTCHECK_EN_STOPWORDS
+    filtered = [t for t in tokens if t not in stopwords and len(t) >= 3]
+    ranked = [tok for tok, _ in Counter(filtered).most_common(limit * 2)]
+    out: list[str] = []
+    for tok in ranked:
+        if tok not in out:
+            out.append(tok)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _text_similarity(a: str, b: str) -> float:
+    left = normalize_fa_text(a)
+    right = normalize_fa_text(b)
+    if not left or not right:
+        return 0.0
+    ratio = SequenceMatcher(None, left, right).ratio()
+    left_set = set(_tokenize_fact_text(left))
+    right_set = set(_tokenize_fact_text(right))
+    if not left_set or not right_set:
+        return ratio
+    inter = len(left_set & right_set)
+    union = len(left_set | right_set)
+    jaccard = inter / union if union else 0.0
+    contains = 1.0 if (left in right or right in left) else 0.0
+    return (0.52 * ratio) + (0.38 * jaccard) + (0.10 * contains)
+
+
+def db_search_news_candidates(search_terms: list[str], limit: int = 220) -> list[dict[str, Any]]:
+    ensure_database_ready()
+    terms = [t for t in search_terms if t and len(t) >= 3][:10]
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.cursor()
+            if terms:
+                where = " OR ".join(["normalized_title LIKE ?"] * len(terms))
+                like_params = [f"%{normalize_fa_text(t)}%" for t in terms]
+                cur.execute(
+                    f"""
+                    SELECT source, source_region, source_lang, source_tier, title, summary, link, published_ts, normalized_title, fetched_at
+                    FROM news_index
+                    WHERE {where}
+                    ORDER BY COALESCE(published_ts, fetched_at, 0) DESC
+                    LIMIT ?
+                    """,
+                    (*like_params, int(limit)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT source, source_region, source_lang, source_tier, title, summary, link, published_ts, normalized_title, fetched_at
+                    FROM news_index
+                    ORDER BY COALESCE(published_ts, fetched_at, 0) DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "source": str(row[0] or ""),
+                "source_region": str(row[1] or ""),
+                "source_lang": str(row[2] or ""),
+                "source_tier": _infer_source_tier(str(row[0] or ""), str(row[3] or "medium")),
+                "title": str(row[4] or ""),
+                "summary": str(row[5] or ""),
+                "link": str(row[6] or ""),
+                "published_ts": int(row[7]) if row[7] is not None else None,
+                "normalized_title": str(row[8] or ""),
+                "fetched_at": int(row[9]) if row[9] is not None else 0,
+            }
+        )
+    return out
+
+
+def _extract_json_payload(raw: str) -> str:
+    txt = (raw or "").strip()
+    if not txt:
+        return ""
+    if txt.startswith("```"):
+        txt = re.sub(r"^```(?:json)?", "", txt).strip()
+        txt = re.sub(r"```$", "", txt).strip()
+    m = re.search(r"(\[[\s\S]+\])", txt)
+    if m:
+        return m.group(1)
+    return txt
+
+
+def _ai_translate_fact_text(text: str, target_lang: str) -> str:
+    if not OPENAI_API_KEY:
+        return ""
+    source = (text or "").strip()
+    if not source:
+        return ""
+    target = "English" if target_lang == "en" else "Persian"
+    prompt = (
+        "Translate this news claim accurately. "
+        f"Target language: {target}. "
+        "Keep names, numbers, and dates exact. "
+        "Return only the translated sentence.\n\n"
+        f"Claim: {source}"
+    )
+    return call_recommendation_model(prompt, max_output_tokens=140, reasoning_effort="low").strip()
+
+
+def _ai_distill_claim(text: str) -> str:
+    if not OPENAI_API_KEY:
+        return ""
+    source = (text or "").strip()
+    if not source:
+        return ""
+    prompt = (
+        "You are extracting a single fact-checkable claim from a news text.\n"
+        "Return one concise sentence (max 35 words) that preserves entities, numbers, and dates.\n"
+        "Do not explain. Do not add uncertainty words.\n\n"
+        f"Text:\n{source}"
+    )
+    return call_recommendation_model(prompt, max_output_tokens=120, reasoning_effort="low").strip()
+
+
+def _ai_label_evidence(claim: str, evidence: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    if not OPENAI_API_KEY or not evidence:
+        return {}
+    lines: list[str] = []
+    for idx, item in enumerate(evidence, start=1):
+        title = _clean_html_text(item.get("title", ""))[:180]
+        summary = _clean_html_text(item.get("summary", ""))[:220]
+        source = _clean_html_text(item.get("source", ""))[:60]
+        lines.append(f"{idx}. source={source} | title={title} | summary={summary}")
+    prompt = (
+        "You are a fact-check evidence classifier.\n"
+        "Given one claim and evidence headlines/snippets, label each line as one of:\n"
+        "support, refute, related, irrelevant.\n"
+        "Return JSON array only with shape:\n"
+        "[{\"idx\":1,\"label\":\"support\",\"confidence\":0-100,\"reason\":\"short\"}]\n"
+        "Confidence must reflect evidence strength for this specific claim.\n\n"
+        f"Claim: {claim}\n\n"
+        "Evidence:\n"
+        + "\n".join(lines)
+    )
+    raw = call_recommendation_model(prompt, max_output_tokens=700, reasoning_effort="low")
+    payload = _extract_json_payload(raw)
+    if not payload:
+        return {}
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return {}
+    if not isinstance(data, list):
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        idx_raw = item.get("idx")
+        try:
+            idx = int(idx_raw)
+        except Exception:
+            continue
+        label = normalize_text(str(item.get("label", "related")))
+        if label not in FACT_LABEL_WEIGHTS:
+            label = "related"
+        try:
+            conf = float(item.get("confidence", 50))
+        except Exception:
+            conf = 50.0
+        out[idx - 1] = {
+            "label": label,
+            "confidence": max(0.0, min(100.0, conf)) / 100.0,
+            "reason": str(item.get("reason", ""))[:200],
+        }
+    return out
+
+
+def _ai_factcheck_reasoning(
+    claim: str,
+    evidence: list[dict[str, Any]],
+    scored_summary: dict[str, Any],
+) -> dict[str, Any]:
+    if not OPENAI_API_KEY or not evidence:
+        return {}
+    lines: list[str] = []
+    for idx, item in enumerate(evidence, start=1):
+        title = _clean_html_text(item.get("title", ""))[:170]
+        summary = _clean_html_text(item.get("summary", ""))[:220]
+        source = _clean_html_text(item.get("source", ""))[:70]
+        date_text = _fmt_news_date(item.get("published_ts"))
+        label = normalize_text(str(item.get("label", "related")))
+        lines.append(
+            f"{idx}. source={source} | date={date_text} | label={label} | title={title} | summary={summary} | link={item.get('link','')}"
+        )
+
+    prompt = (
+        "You are an evidence-grounded fact-check analyst.\n"
+        "Use ONLY the provided evidence. Do not invent facts.\n"
+        "Return strict JSON object with this shape:\n"
+        "{"
+        "\"overall\":\"short verdict in Persian\","
+        "\"why\":\"concise explanation in Persian\","
+        "\"parts\":[{\"claim_part\":\"...\",\"status\":\"true|false|uncertain\",\"why\":\"...\",\"evidence\":[1,2]}],"
+        "\"missing\":\"what is missing to conclude with high confidence\""
+        "}\n"
+        "Rules:\n"
+        "- For each part, cite evidence indexes that directly support the statement.\n"
+        "- If evidence conflicts, mark uncertain.\n"
+        "- Keep output concise and factual.\n\n"
+        f"Claim: {claim}\n"
+        f"Score summary: truth_prob={float(scored_summary.get('truth_prob',0.5)):.2f}, "
+        f"fake_prob={float(scored_summary.get('fake_prob',0.5)):.2f}, "
+        f"confidence={float(scored_summary.get('confidence',0.2)):.2f}\n\n"
+        "Evidence list:\n"
+        + "\n".join(lines)
+    )
+    raw = call_recommendation_model(prompt, max_output_tokens=820, reasoning_effort="low")
+    payload = _extract_json_payload(raw)
+    if not payload:
+        return {}
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    parts = data.get("parts")
+    if isinstance(parts, list):
+        normalized_parts = []
+        for part in parts[:6]:
+            if not isinstance(part, dict):
+                continue
+            idxs = []
+            for i in (part.get("evidence") or []):
+                try:
+                    ii = int(i)
+                except Exception:
+                    continue
+                if 1 <= ii <= len(evidence):
+                    idxs.append(ii)
+            status = normalize_text(str(part.get("status", "uncertain")))
+            if status not in ("true", "false", "uncertain"):
+                status = "uncertain"
+            normalized_parts.append(
+                {
+                    "claim_part": str(part.get("claim_part", ""))[:220],
+                    "status": status,
+                    "why": str(part.get("why", ""))[:260],
+                    "evidence": sorted(set(idxs)),
+                }
+            )
+        data["parts"] = normalized_parts
+    else:
+        data["parts"] = []
+    data["overall"] = str(data.get("overall", ""))[:260]
+    data["why"] = str(data.get("why", ""))[:360]
+    data["missing"] = str(data.get("missing", ""))[:320]
+    return data
+
+
+def _contains_negation(text: str) -> bool:
+    norm = normalize_fa_text(text)
+    return any(term in norm for term in FACT_NEGATION_TERMS)
+
+
+def _heuristic_label(claim: str, item: dict[str, Any], relevance: float) -> tuple[str, float, str]:
+    combined = f"{item.get('title', '')} {item.get('summary', '')}".strip()
+    neg_claim = _contains_negation(claim)
+    neg_item = _contains_negation(combined)
+    if relevance < 0.20:
+        return "irrelevant", 0.30, "ارتباط واژگانی کم"
+    if relevance >= 0.62:
+        if neg_claim != neg_item:
+            return "refute", 0.58, "واژگان تکذیب/رد متفاوت است"
+        return "support", 0.60, "شباهت محتوایی بالا"
+    if relevance >= 0.36:
+        return "related", 0.52, "موضوع مشابه ولی تایید قطعی ندارد"
+    return "irrelevant", 0.35, "ارتباط مستقیم کافی نیست"
+
+
+def _score_factcheck(
+    claim: str,
+    items: list[dict[str, Any]],
+    ai_labels: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    if not items:
+        return {
+            "verdict": "نامطمئن",
+            "truth_prob": 0.5,
+            "fake_prob": 0.5,
+            "confidence": 0.15,
+            "evidence": [],
+            "support_count": 0,
+            "refute_count": 0,
+            "related_count": 0,
+            "source_count": 0,
+        }
+
+    now_ts = int(time.time())
+    net_score = 0.0
+    total_strength = 0.0
+    support_count = 0
+    refute_count = 0
+    related_count = 0
+    seen_sources: set[str] = set()
+    scored: list[dict[str, Any]] = []
+
+    for idx, item in enumerate(items):
+        evidence_text = f"{item.get('title', '')} {item.get('summary', '')}".strip()
+        relevance = float(item.get("relevance", _text_similarity(claim, evidence_text)))
+        ai = ai_labels.get(idx, {})
+        if ai:
+            label = normalize_text(str(ai.get("label", "related")))
+            conf = float(ai.get("confidence", 0.55))
+            reason = str(ai.get("reason", ""))[:200]
+            if label not in FACT_LABEL_WEIGHTS:
+                label, conf, reason = _heuristic_label(claim, item, relevance)
+        else:
+            label, conf, reason = _heuristic_label(claim, item, relevance)
+
+        tier = _infer_source_tier(str(item.get("source", "")), str(item.get("source_tier", "medium")))
+        source_weight = SOURCE_TIER_WEIGHTS.get(tier, SOURCE_TIER_WEIGHTS["medium"])
+        published_ts = int(item.get("published_ts") or item.get("fetched_at") or now_ts)
+        age_days = max(0.0, (now_ts - published_ts) / 86400.0)
+        freshness = 1.0 / (1.0 + (age_days / 14.0))
+        unit = source_weight * (0.35 + 0.65 * max(0.0, min(1.0, conf)))
+        unit *= (0.30 + 0.70 * max(0.0, min(1.0, relevance)))
+        unit *= (0.55 + 0.45 * freshness)
+        effect = FACT_LABEL_WEIGHTS.get(label, 0.0) * unit
+
+        if label == "support":
+            support_count += 1
+        elif label == "refute":
+            refute_count += 1
+        elif label == "related":
+            related_count += 1
+
+        seen_sources.add(normalize_text(str(item.get("source", ""))))
+        net_score += effect
+        total_strength += abs(effect)
+        scored.append(
+            {
+                **item,
+                "label": label,
+                "label_conf": conf,
+                "reason": reason,
+                "tier": tier,
+                "effect": effect,
+                "relevance": relevance,
+                "freshness": freshness,
+            }
+        )
+
+    coverage = min(1.0, len([s for s in seen_sources if s]) / 6.0)
+    base_prob = 1.0 / (1.0 + exp(-2.7 * net_score))
+    truth_prob = (0.88 * base_prob) + (0.12 * coverage)
+    truth_prob = max(0.03, min(0.97, truth_prob))
+    fake_prob = 1.0 - truth_prob
+    confidence = 0.23 + min(0.43, total_strength / max(1.0, len(items)))
+    confidence += 0.20 * coverage
+    confidence += 0.12 * min(1.0, len(items) / 8.0)
+    confidence = max(0.10, min(0.97, confidence))
+
+    verdict = "نامطمئن"
+    if confidence >= 0.45:
+        if truth_prob >= 0.65:
+            verdict = "احتمالاً واقعی"
+        elif truth_prob <= 0.35:
+            verdict = "احتمالاً فیک/گمراه‌کننده"
+        else:
+            verdict = "نیازمند بررسی بیشتر"
+
+    scored.sort(key=lambda x: abs(float(x.get("effect", 0.0))), reverse=True)
+    return {
+        "verdict": verdict,
+        "truth_prob": truth_prob,
+        "fake_prob": fake_prob,
+        "confidence": confidence,
+        "evidence": scored,
+        "support_count": support_count,
+        "refute_count": refute_count,
+        "related_count": related_count,
+        "source_count": len([s for s in seen_sources if s]),
+    }
+
+
+def _fmt_news_date(ts: int | None) -> str:
+    if not ts:
+        return "--"
+    try:
+        return datetime.fromtimestamp(int(ts), tz=TEHRAN_TZ).strftime("%Y-%m-%d")
+    except Exception:
+        return "--"
+
+
+def run_news_factcheck(text: str) -> dict[str, Any]:
+    raw_text = _clean_html_text(text or "")
+    if not raw_text:
+        return {"ok": False, "error": "متن خبر خالی است."}
+
+    claim = _ai_distill_claim(raw_text) or raw_text[:420]
+    claim = " ".join(claim.split())[:500]
+    lang = _guess_news_lang(claim)
+    translated = ""
+    if lang == "fa":
+        translated = _ai_translate_fact_text(claim, "en")
+    elif lang == "en":
+        translated = _ai_translate_fact_text(claim, "fa")
+
+    queries: list[str] = [claim]
+    if translated and normalize_text(translated) != normalize_text(claim):
+        queries.append(translated)
+    keywords = _extract_fact_keywords(claim, limit=7)
+    if keywords:
+        keyword_query = " ".join(keywords)
+        if keyword_query and keyword_query not in queries:
+            queries.append(keyword_query)
+    # Keep the search compact to avoid long user wait.
+    uniq_queries: list[str] = []
+    for q in queries:
+        qq = " ".join((q or "").split()).strip()
+        if qq and qq not in uniq_queries:
+            uniq_queries.append(qq)
+    uniq_queries = uniq_queries[:FACTCHECK_QUERY_MAX]
+
+    refresh_info = refresh_news_index(force=False)
+    fetched: list[dict[str, Any]] = []
+    for query in uniq_queries:
+        fetched.extend(_fetch_query_news_items(query))
+    if fetched:
+        db_upsert_news_items(fetched)
+
+    search_terms = _extract_fact_keywords(" ".join(uniq_queries), limit=10)
+    local_candidates = db_search_news_candidates(search_terms, limit=260)
+    ranked: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in local_candidates:
+        key = f"{normalize_text(item.get('source', ''))}|{normalize_text(item.get('link', ''))}"
+        if key in seen:
+            continue
+        seen.add(key)
+        combined = f"{item.get('title', '')} {item.get('summary', '')}".strip()
+        relevance = _text_similarity(claim, combined)
+        if relevance < 0.16:
+            continue
+        item["relevance"] = relevance
+        ranked.append(item)
+    ranked.sort(
+        key=lambda x: (
+            float(x.get("relevance", 0.0)),
+            int(x.get("published_ts") or x.get("fetched_at") or 0),
+        ),
+        reverse=True,
+    )
+    selected = ranked[: max(FACTCHECK_MAX_EVIDENCE * 2, 12)]
+    ai_labels = _ai_label_evidence(claim, selected[:FACTCHECK_MAX_EVIDENCE])
+    scored = _score_factcheck(claim, selected[:FACTCHECK_MAX_EVIDENCE], ai_labels)
+    top_evidence = scored.get("evidence", [])[:FACTCHECK_MAX_EVIDENCE]
+    ai_reasoning = _ai_factcheck_reasoning(claim, top_evidence, scored)
+    return {
+        "ok": True,
+        "claim": claim,
+        "lang": lang,
+        "translated_claim": translated,
+        "queries": uniq_queries,
+        "refresh_info": refresh_info,
+        "fetched_count": len(fetched),
+        "candidate_count": len(ranked),
+        "ai_reasoning": ai_reasoning,
+        **scored,
+    }
+
+
+def build_factcheck_report(result: dict[str, Any]) -> str:
+    if not result.get("ok", False):
+        return f"⛔️ خطا در راستی‌آزمایی: {result.get('error', 'نامشخص')}"
+
+    truth_pct = int(round(float(result.get("truth_prob", 0.5)) * 100))
+    fake_pct = int(round(float(result.get("fake_prob", 0.5)) * 100))
+    conf_pct = int(round(float(result.get("confidence", 0.2)) * 100))
+    claim = str(result.get("claim", ""))[:500]
+    translated = str(result.get("translated_claim", "")).strip()
+    evidence = list(result.get("evidence", []))
+    verdict = str(result.get("verdict", "نامطمئن"))
+    reasoning = result.get("ai_reasoning", {}) if isinstance(result.get("ai_reasoning"), dict) else {}
+
+    lines = [
+        "🧪 راستی‌آزمایی خبر",
+        f"🎯 ادعای اصلی: {claim}",
+        f"🧭 نتیجه: {verdict}",
+        f"• احتمال واقعی بودن: {truth_pct}٪",
+        f"• احتمال فیک/گمراه‌کننده بودن: {fake_pct}٪",
+        f"• سطح اطمینان تحلیل: {conf_pct}٪",
+        (
+            f"📚 شواهد: موافق {int(result.get('support_count', 0))} | "
+            f"مخالف {int(result.get('refute_count', 0))} | "
+            f"مرتبط {int(result.get('related_count', 0))}"
+        ),
+        f"🌐 تنوع منبع: {int(result.get('source_count', 0))} منبع",
+    ]
+    if translated:
+        lang = str(result.get("lang", "unknown"))
+        if lang == "fa":
+            lines.append(f"🔄 ترجمه انگلیسی ادعا: {translated[:260]}")
+        elif lang == "en":
+            lines.append(f"🔄 ترجمه فارسی ادعا: {translated[:260]}")
+
+    if reasoning:
+        overall = str(reasoning.get("overall", "")).strip()
+        why = str(reasoning.get("why", "")).strip()
+        missing = str(reasoning.get("missing", "")).strip()
+        parts = reasoning.get("parts", []) if isinstance(reasoning.get("parts"), list) else []
+        if overall:
+            lines.append(f"🧠 تحلیل هوشمند: {overall}")
+        if why:
+            lines.append(f"• چرا: {why}")
+        if parts:
+            lines.append("🔬 بررسی جزءبه‌جزء ادعا:")
+            status_map = {"true": "✅ درست", "false": "❌ نادرست", "uncertain": "⚪️ نامطمئن"}
+            for part in parts[:5]:
+                if not isinstance(part, dict):
+                    continue
+                ptxt = str(part.get("claim_part", "")).strip()
+                pwhy = str(part.get("why", "")).strip()
+                status = status_map.get(normalize_text(str(part.get("status", "uncertain"))), "⚪️ نامطمئن")
+                evid_ids = []
+                for eidx in (part.get("evidence") or []):
+                    try:
+                        evid_ids.append(int(eidx))
+                    except Exception:
+                        pass
+                refs = f" [منابع: {', '.join(str(x) for x in sorted(set(evid_ids)))}]" if evid_ids else ""
+                if ptxt:
+                    lines.append(f"• {status}: {ptxt}{refs}")
+                if pwhy:
+                    lines.append(f"  ↳ {pwhy}")
+        if missing:
+            lines.append(f"🧩 شکاف اطلاعاتی: {missing}")
+
+    lines.append("🔎 منابع شاخص:")
+    label_icon = {"support": "✅", "refute": "❌", "related": "➖", "irrelevant": "▫️"}
+    for idx, item in enumerate(evidence[:6], start=1):
+        label = normalize_text(str(item.get("label", "related")))
+        icon = label_icon.get(label, "▫️")
+        source = str(item.get("source", "منبع ناشناس"))[:50]
+        title = str(item.get("title", ""))[:160]
+        link = str(item.get("link", ""))[:300]
+        date_text = _fmt_news_date(item.get("published_ts"))
+        lines.append(f"{idx}) {icon} [{source}] ({date_text}) {title}")
+        if link:
+            lines.append(link)
+
+    lines.append("⚠️ این خروجی خودکار است و برای تصمیم حساس باید با منابع رسمی تکمیلی چک شود.")
+
+    # Telegram hard limit guard.
+    output = "\n".join(lines)
+    while len(output) > 3900 and len(lines) > 14:
+        lines.pop(-2 if len(lines) > 2 else -1)
+        output = "\n".join(lines)
+    return output
+
+
+def maybe_refresh_news_index_background() -> None:
+    try:
+        refresh_news_index(force=False)
+    except Exception:
+        pass
 
 
 def track_message_context(message, action: str = "message") -> None:
@@ -1412,6 +2481,102 @@ def call_ai_chat_model(messages: list[dict[str, str]], max_output_tokens: int | 
     )
 
 
+SUMMARIZER_MAX_INPUT_CHARS = max(1500, int(os.getenv("SUMMARIZER_MAX_INPUT_CHARS", "12000")))
+SUMMARIZER_MAX_OUTPUT_CHARS = max(700, int(os.getenv("SUMMARIZER_MAX_OUTPUT_CHARS", "1900")))
+
+
+def _split_sentences(text: str) -> list[str]:
+    value = " ".join((text or "").split())
+    if not value:
+        return []
+    parts = re.split(r"(?<=[\.\!\?؟؛])\s+|[\r\n]+", value)
+    out: list[str] = []
+    for part in parts:
+        p = part.strip(" \t-•")
+        if len(p) >= 2:
+            out.append(p)
+    return out
+
+
+def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int = 4) -> str:
+    source = _clean_html_text(text or "")
+    if not source:
+        return "متنی برای خلاصه‌سازی پیدا نشد."
+
+    sentences = _split_sentences(source)
+    if not sentences:
+        clipped = source[:420].rstrip()
+        return f"خلاصه:\n{clipped}"
+
+    lang = _guess_news_lang(source)
+    stopwords = FACTCHECK_FA_STOPWORDS if lang == "fa" else FACTCHECK_EN_STOPWORDS
+    token_freq: Counter[str] = Counter()
+    sent_tokens: list[list[str]] = []
+    for s in sentences:
+        toks = [t for t in _tokenize_fact_text(s) if len(t) >= 3 and t not in stopwords]
+        sent_tokens.append(toks)
+        token_freq.update(toks)
+
+    scored: list[tuple[int, float]] = []
+    for idx, toks in enumerate(sent_tokens):
+        if not toks:
+            scored.append((idx, 0.0))
+            continue
+        base = sum(token_freq.get(t, 0) for t in toks) / max(1.0, len(toks) * 0.9)
+        pos_boost = 1.0 if idx == 0 else (0.88 if idx <= 2 else 0.70)
+        scored.append((idx, base * pos_boost))
+
+    min_keep = 3 if len(sentences) >= 4 else 2
+    keep_n = min(max_sentences, max(min_keep, min(6, len(sentences) // 3 + 1)))
+    top_idx = {0}
+    for idx, _score in sorted(scored, key=lambda x: x[1], reverse=True):
+        top_idx.add(idx)
+        if len(top_idx) >= keep_n:
+            break
+
+    ordered_idx = sorted(top_idx)
+    summary = " ".join(sentences[i] for i in ordered_idx).strip()
+    summary = summary[:900].rstrip()
+
+    point_limit = min(max_points, len(ordered_idx))
+    points = [sentences[i][:180].rstrip() for i in ordered_idx[:point_limit]]
+
+    lines = ["📝 خلاصه", summary, "", "🔹 نکات کلیدی"]
+    for p in points:
+        lines.append(f"• {p}")
+    return "\n".join(lines).strip()
+
+
+def _extract_summarize_input_text(message) -> str:
+    reply = getattr(message, "reply_to_message", None)
+    reply_text = _extract_message_text(reply) if reply is not None else ""
+    if reply_text and reply_text.strip():
+        return reply_text.strip()
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) >= 2:
+        return parts[1].strip()
+    return ""
+
+
+def run_text_summarizer(message, source_text: str) -> str:
+    source = _clean_html_text(source_text or "")
+    if not source:
+        return "⛔️ متن قابل خلاصه‌سازی پیدا نشد."
+    if len(source) > SUMMARIZER_MAX_INPUT_CHARS:
+        source = source[:SUMMARIZER_MAX_INPUT_CHARS].rstrip() + "..."
+
+    if is_group_chat(message):
+        cfg = get_group_config(message.chat.id)
+        if not cfg.get("ai_enabled", True):
+            return "خلاصه‌ساز داخلی برای این گروه خاموش است."
+
+    out = _extractive_summary_local(source)
+    out = _normalize_ai_output(out, max_chars=SUMMARIZER_MAX_OUTPUT_CHARS)
+    lines = ["🧠 خلاصه‌ساز داخلی", out]
+    return "\n\n".join(x for x in lines if x).strip()
+
+
 def _normalize_ai_output(text: str, max_chars: int = 1100) -> str:
     out = (text or "").strip()
     if not out:
@@ -1716,7 +2881,7 @@ def _menu_keyboard(is_group: bool = False):
     kb.add(types.KeyboardButton("💰 خرج و دنگ"), types.KeyboardButton("📂 آرشیو"))
     kb.add(types.KeyboardButton("🎯 پیشنهاد شخصی"), types.KeyboardButton("🎬 پیشنهاد روزانه"))
     kb.add(types.KeyboardButton("🤖 چت هوش مصنوعی"))
-    kb.add(types.KeyboardButton("⚙️ راهنما"))
+    kb.add(types.KeyboardButton("⚙️ راهنما"), types.KeyboardButton("📘 راهنمای کامل"))
     if is_group:
         kb.add(types.KeyboardButton("⚙️ تنظیمات گروه"), types.KeyboardButton("🚀 ارسال فوری"))
     return kb
@@ -2248,6 +3413,7 @@ def maybe_pin_report(chat_id: int, message_id: int, cfg: dict[str, Any]) -> None
 def help_text() -> str:
     return (
         "🤖 راهنمای ربات\n"
+        "• راهنمای کامل قابلیت‌ها: /guide\n"
         "• خصوصی: /prices یا /menu\n"
         "• گروه: /gprices یا تریگر سفارشی (پیش فرض !prices)\n"
         "• نمایش بیشترین تغییر: /top_changes\n"
@@ -2285,6 +3451,14 @@ def help_text() -> str:
         "• ادامه گفتگو: روی جواب AI ریپلای کن و پیام بده\n"
         "• شروع اجباری مکالمه جدید: /ai_new سوال\n"
         "• وضعیت مصرف گروه: /ai_usage\n\n"
+        "🧠 خلاصه‌ساز متن:\n"
+        "• روی پیام طولانی ریپلای کن: /summarize\n"
+        "• یا مستقیم: /summarize متن\n\n"
+        "• موتور خلاصه‌سازی: داخلی (بدون API)\n\n"
+        "🧪 راستی‌آزمایی خبر:\n"
+        "• روی پیام خبر ریپلای کن: /factcheck\n"
+        "• یا مستقیم: /factcheck متن خبر\n\n"
+        "• نسخه پیشرفته سندمحور: /fact_pro\n\n"
         "🎬 پیشنهاد روزانه:\n"
         "• از دکمه «🎬 پیشنهاد روزانه» پنل کامل را باز کن (بدون کامند)\n"
         "• نوع ارسال: فیلم/سریال/کتاب (هرکدام جدا روشن/خاموش)\n"
@@ -2305,6 +3479,74 @@ def help_text() -> str:
         "/toggle_mention\n"
         "/send_now\n"
         "/group_reset"
+    )
+
+
+def full_guide_text(is_group: bool = False) -> str:
+    scope = "گروه" if is_group else "خصوصی"
+    group_tip = (
+        "• در گروه، برای دستورهای دارای @BotUsername هم می‌تونی از نسخه ساده دستور استفاده کنی.\n"
+        "• اگر Privacy Mode روشن باشد، برخی دستورات فقط با /command یا ریپلای دقیق بهتر جواب می‌دهند.\n\n"
+    )
+    if not is_group:
+        group_tip = (
+            "• برای قابلیت‌های گروهی (امتیاز، دنگ، تنظیمات، فوروارد هوشمند) باید داخل گروه از بات استفاده کنی.\n\n"
+        )
+    return (
+        "📘 راهنمای کامل ربات\n"
+        f"حالت فعلی چت: {scope}\n\n"
+        "1) بازار ارز/سکه/طلا/کریپتو\n"
+        "• قیمت کامل: /prices (خصوصی) یا /gprices (گروه)\n"
+        "• بیشترین تغییر: /top_changes\n"
+        "• کلیدواژه سریع: دلار، یورو، طلا، سکه، بیت کوین، تتر\n"
+        "• دکمه‌ها: 📊 قیمت کامل | 💱 ارزهای مهم | 🪙 سکه ها | 📈 بیشترین تغییر\n\n"
+        "2) چت هوش مصنوعی\n"
+        "• شروع جدید: /ai سوال\n"
+        "• شروع جدید اجباری: /ai_new سوال\n"
+        "• ادامه گفتگو: روی آخرین پاسخ AI ریپلای کن و پیام بده\n"
+        "• حالت سریع: «هوش ...» یا «ai ...»\n"
+        "• مصرف گروه: /ai_usage\n\n"
+        "3) خلاصه‌سازی متن طولانی\n"
+        "• روی پیام طولانی ریپلای کن: /summarize\n"
+        "• یا مستقیم: /summarize متن\n"
+        "• خلاصه‌سازی کاملا با موتور داخلی خود ربات انجام می‌شود (بدون API).\n\n"
+        "4) راستی‌آزمایی خبر\n"
+        "• روی خبر ریپلای کن: /factcheck\n"
+        "• یا مستقیم: /factcheck متن خبر\n"
+        "• نسخه پیشرفته: /fact_pro (تحلیل جزءبه‌جزء + منابع شماره‌دار)\n"
+        "• خروجی: درصد احتمال واقعی/فیک + منابع شاخص + جمع‌بندی\n\n"
+        "5) خرج و دنگ گروهی\n"
+        "• ثبت خرج: /add 480 پیتزا\n"
+        "• ساخت/تعویض لیست: /list_new عنوان | /lists | /list_use l2\n"
+        "• اعضا: /join_split | /list_add_member (روی پیام کاربر) | /list_remove_member\n"
+        "• گزارش/تسویه: /expenses | /split | /clear_expenses\n"
+        "• پنل: /expense_panel\n\n"
+        "6) آرشیو گروه\n"
+        "• متن/یادداشت: /save کلید | مقدار ، /get کلید ، /list_saved\n"
+        "• ذخیره ارجاع پیام: /save_msg (روی پیام ریپلای) ، /get_msg کلید ، /list_msgs ، /del_msg کلید\n\n"
+        "7) فوروارد هوشمند کانال به گروه\n"
+        "• روشن/خاموش: /fw_on | /fw_off\n"
+        "• مدیریت منابع: /fw_add_channel @channel ، /fw_del_channel @channel\n"
+        "• کلیدواژه‌ها: /fw_add_keyword عبارت ، /fw_del_keyword عبارت ، /fw_list\n\n"
+        "8) امتیاز و شوخی گروه\n"
+        "• روی پیام کاربر ریپلای کن و بنویس: «کسشر شناسایی شد» یا «جمله طلایی»\n"
+        "• جدول: /scoreboard ، امتیاز من: /my_score\n\n"
+        "9) پیشنهاد محتوا\n"
+        "• پیشنهاد شخصی (خصوصی): /recommend_me\n"
+        "• پیشنهاد روزانه گروه: /reco_on | /reco_off | /set_reco_time 21:30 | /send_reco_now\n\n"
+        "10) تنظیمات گروه (ادمین)\n"
+        "• پنل: /group_menu یا /group_settings\n"
+        "• کلیدها: /group_on | /group_off | /set_group_cmd !prices\n"
+        "• زمان‌بندی: /auto_on | /auto_off | /set_interval 15 | /set_cooldown 20\n"
+        "• نمایش/ارسال: /set_title ... | /set_silent on|off | /toggle_crypto | /toggle_pin | /toggle_mention\n"
+        "• ارسال فوری/ریست: /send_now | /group_reset\n\n"
+        "نکات مهم\n"
+        f"{group_tip}"
+        "مثال‌های سریع\n"
+        "• /ai یه تحلیل کوتاه از وضعیت دلار بده\n"
+        "• /summarize (روی یک پیام طولانی ریپلای)\n"
+        "• /factcheck (روی یک خبر ریپلای)\n"
+        "• /add 260000 تاکسی"
     )
 
 
@@ -2364,6 +3606,7 @@ def group_settings_text(cfg: dict[str, Any], chat_id: int | None = None) -> str:
 def scheduler_loop() -> None:
     while True:
         try:
+            maybe_refresh_news_index_background()
             maybe_send_due_reminders()
             maybe_send_daily_recommendations()
             now = int(time.time())
@@ -2433,6 +3676,16 @@ def help_cmd(message):
         bot.send_message(message.chat.id, help_text(), reply_markup=types.ReplyKeyboardRemove())
     else:
         bot.send_message(message.chat.id, help_text(), reply_markup=_menu_keyboard(is_group=False))
+
+
+@bot.message_handler(commands=["guide", "full_guide", "group_guide"])
+def guide_cmd(message):
+    track_message_context(message, action="guide")
+    text = full_guide_text(is_group=is_group_chat(message))
+    if is_group_chat(message):
+        bot.send_message(message.chat.id, text, reply_markup=types.ReplyKeyboardRemove())
+    else:
+        bot.send_message(message.chat.id, text, reply_markup=_menu_keyboard(is_group=False))
 
 
 @bot.message_handler(commands=["prices"])
@@ -3875,6 +5128,125 @@ def ai_usage(message):
     )
 
 
+@bot.message_handler(commands=["summarize", "sum", "tldr", "tl_dr", "kholase"])
+def summarize_text_command(message):
+    track_message_context(message, action="summarize_command")
+    if is_group_chat(message) and not is_for_this_bot(_command_head(message)):
+        return
+
+    source_text = _extract_summarize_input_text(message)
+    if not source_text:
+        bot.reply_to(
+            message,
+            "برای خلاصه‌سازی:\n"
+            "1) روی پیام طولانی ریپلای کن و /summarize بزن\n"
+            "2) یا مستقیم بنویس: /summarize متن طولانی",
+        )
+        return
+
+    status = bot.reply_to(
+        message,
+        "🧠 در حال خلاصه‌سازی دقیق متن...\n"
+        "• استخراج نکات اصلی\n"
+        "• حفظ اعداد/نام‌ها/زمان‌ها\n"
+        "• تولید نسخه کوتاه و دقیق",
+    )
+    report = run_text_summarizer(message, source_text)
+    try:
+        bot.edit_message_text(
+            report,
+            chat_id=status.chat.id,
+            message_id=status.message_id,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        bot.reply_to(message, report, disable_web_page_preview=True)
+
+
+def _extract_factcheck_input_text(message) -> str:
+    reply = getattr(message, "reply_to_message", None)
+    reply_text = _extract_message_text(reply) if reply is not None else ""
+    if reply_text and reply_text.strip():
+        return reply_text.strip()
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) >= 2:
+        return parts[1].strip()
+    return ""
+
+
+@bot.message_handler(commands=["factcheck", "verify_news", "newscheck"])
+def factcheck_news(message):
+    track_message_context(message, action="factcheck_command")
+    if is_group_chat(message) and not is_for_this_bot(_command_head(message)):
+        return
+
+    source_text = _extract_factcheck_input_text(message)
+    if not source_text:
+        bot.reply_to(
+            message,
+            "برای راستی‌آزمایی:\n"
+            "1) روی پیام خبر ریپلای کن و /factcheck بزن\n"
+            "2) یا مستقیم بنویس: /factcheck متن خبر",
+        )
+        return
+
+    status = bot.reply_to(
+        message,
+        "🔎 در حال بررسی خبر...\n"
+        "• جمع‌آوری از منابع داخلی/خارجی\n"
+        "• جست‌وجو در Google/Bing News RSS\n"
+        "• امتیازدهی موافق/مخالف و جمع‌بندی",
+    )
+    result = run_news_factcheck(source_text)
+    report = build_factcheck_report(result)
+    try:
+        bot.edit_message_text(
+            report,
+            chat_id=status.chat.id,
+            message_id=status.message_id,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        bot.reply_to(message, report, disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=["fact_pro", "factcheck_pro", "verify_claim"])
+def factcheck_news_pro(message):
+    track_message_context(message, action="factcheck_pro_command")
+    if is_group_chat(message) and not is_for_this_bot(_command_head(message)):
+        return
+
+    source_text = _extract_factcheck_input_text(message)
+    if not source_text:
+        bot.reply_to(
+            message,
+            "برای راستی‌آزمایی پیشرفته:\n"
+            "1) روی پیام خبر ریپلای کن و /fact_pro بزن\n"
+            "2) یا مستقیم بنویس: /fact_pro متن خبر",
+        )
+        return
+
+    status = bot.reply_to(
+        message,
+        "🧪 در حال راستی‌آزمایی پیشرفته...\n"
+        "• تحلیل خبر با هوش مصنوعی\n"
+        "• استخراج فکت‌های جزئی و تناقض‌ها\n"
+        "• ارائه سند و لینک منبع",
+    )
+    result = run_news_factcheck(source_text)
+    report = build_factcheck_report(result)
+    try:
+        bot.edit_message_text(
+            report,
+            chat_id=status.chat.id,
+            message_id=status.message_id,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        bot.reply_to(message, report, disable_web_page_preview=True)
+
+
 def is_owner(user_id: int) -> bool:
     return OWNER_USER_ID > 0 and int(user_id) == OWNER_USER_ID
 
@@ -4469,6 +5841,7 @@ def quick_keyword_reply(message):
         "🎬 پیشنهاد روزانه",
         "🤖 چت هوش مصنوعی",
         "⚙️ راهنما",
+        "📘 راهنمای کامل",
         "⚙️ تنظیمات گروه",
         "🚀 ارسال فوری",
         "📊 قیمت کامل",
@@ -4519,6 +5892,7 @@ def quick_keyword_reply(message):
         "🎬 پیشنهاد روزانه",
         "🤖 چت هوش مصنوعی",
         "⚙️ راهنما",
+        "📘 راهنمای کامل",
         "⚙️ تنظیمات گروه",
         "🚀 ارسال فوری",
         "📊 قیمت کامل",
@@ -4536,6 +5910,21 @@ def menu_buttons(message):
             bot.send_message(message.chat.id, help_text(), reply_markup=types.ReplyKeyboardRemove())
         else:
             bot.send_message(message.chat.id, help_text(), reply_markup=_menu_keyboard(is_group=False))
+        return
+
+    if txt == "📘 راهنمای کامل":
+        if is_group_chat(message):
+            bot.send_message(
+                message.chat.id,
+                full_guide_text(is_group=True),
+                reply_markup=types.ReplyKeyboardRemove(),
+            )
+        else:
+            bot.send_message(
+                message.chat.id,
+                full_guide_text(is_group=False),
+                reply_markup=_menu_keyboard(is_group=False),
+            )
         return
 
     if txt == "🎭 امتیاز و شوخی":
