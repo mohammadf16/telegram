@@ -1158,7 +1158,11 @@ def maybe_send_daily_recommendations() -> None:
             print(f"Daily recommendation error for {chat_id}: {exc}")
 
 
-def call_recommendation_model(prompt: str, max_output_tokens: int = 300) -> str:
+def call_recommendation_model(
+    prompt: str,
+    max_output_tokens: int = 300,
+    reasoning_effort: str | None = None,
+) -> str:
     if not OPENAI_API_KEY:
         log_ai_debug("OPENAI_API_KEY is empty; skipping model call.")
         return ""
@@ -1169,6 +1173,8 @@ def call_recommendation_model(prompt: str, max_output_tokens: int = 300) -> str:
         "input": prompt,
         "max_output_tokens": max_output_tokens,
     }
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=25)
         if res.status_code >= 400:
@@ -1238,11 +1244,15 @@ def _render_ai_prompt(messages: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def call_ai_chat_model(messages: list[dict[str, str]], max_output_tokens: int = 260) -> str:
+def call_ai_chat_model(messages: list[dict[str, str]], max_output_tokens: int = 520) -> str:
     if not OPENAI_API_KEY:
         return ""
     prompt = _render_ai_prompt(messages)
-    return call_recommendation_model(prompt, max_output_tokens=max_output_tokens)
+    return call_recommendation_model(
+        prompt,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort="low",
+    )
 
 
 def _normalize_ai_output(text: str, max_chars: int = 1100) -> str:
@@ -1345,6 +1355,9 @@ def run_ai_chat(message, user_text: str, force_new: bool = False) -> bool:
     history.append({"role": "user", "text": prompt})
     history = _trim_ai_thread(history)
     answer = _normalize_ai_output(call_ai_chat_model(history))
+    if not answer:
+        retry_history = _trim_ai_thread(history, max_items=6)
+        answer = _normalize_ai_output(call_ai_chat_model(retry_history, max_output_tokens=760))
     if not answer:
         log_ai_debug(
             "AI chat returned empty output "
