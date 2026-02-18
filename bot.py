@@ -2586,6 +2586,42 @@ SUMMARIZER_EXTRA_STOPWORDS = {
     "بودن",
     "بود",
 }
+SUMMARIZER_PRIORITY_KEYWORDS = (
+    "درخواست",
+    "همکاری",
+    "وارث",
+    "حساب",
+    "بانک",
+    "واریز",
+    "سپرده",
+    "تراکنش",
+    "مبلغ",
+    "دلار",
+    "یورو",
+    "تقسیم",
+    "درصد",
+    "۵۰",
+    "50",
+    "محرمانه",
+    "ایمیل",
+    "شماره",
+    "مدیر",
+    "عامل",
+    "شرکت",
+    "تاریخ",
+    "مرگ",
+    "فوت",
+)
+SUMMARIZER_REQUEST_KEYWORDS = (
+    "درخواست",
+    "لطفا",
+    "ایمیل بزنید",
+    "پاسخ",
+    "همکاری",
+    "معرفی",
+    "ارسال",
+    "تماس",
+)
 
 
 def _prepare_summary_text(raw: str) -> str:
@@ -2634,7 +2670,7 @@ def _split_sentences(text: str) -> list[str]:
             # If still too long (common in chat text), split by commas/clauses.
             if len(part) > 230:
                 sub_chunks = re.split(
-                    r"[،,]\s+|(?:\s(?:و|ولی|اما|که|چون|بعد|سپس|تا)\s)|(?<=[😂🤣😅😆😁😄😊🙂🙃😉])\s*",
+                    r"[،,؛;]\s+|(?<=[😂🤣😅😆😁😄😊🙂🙃😉])\s*",
                     part,
                 )
                 for sub in sub_chunks:
@@ -2646,11 +2682,18 @@ def _split_sentences(text: str) -> list[str]:
 
     merged: list[str] = []
     for part in out:
-        if merged and re.match(r"^(ولی|اما|که|و)\b", normalize_fa_text(part)):
+        if merged and re.match(r"^(ولی|اما|که|و|بنابراین|پس)\b", normalize_fa_text(part)):
             merged[-1] = f"{merged[-1]} {part}".strip()
         else:
             merged.append(part)
-    return merged[:90]
+
+    compacted: list[str] = []
+    for part in merged:
+        if compacted and len(part) < 22:
+            compacted[-1] = f"{compacted[-1]} {part}".strip()
+        else:
+            compacted.append(part)
+    return compacted[:90]
 
 
 def _sentence_tokens(sentence: str, stopwords: set[str]) -> list[str]:
@@ -2659,6 +2702,51 @@ def _sentence_tokens(sentence: str, stopwords: set[str]) -> list[str]:
         for t in _tokenize_fact_text(sentence)
         if len(t) >= 3 and t not in stopwords and t not in SUMMARIZER_EXTRA_STOPWORDS
     ]
+
+
+def _sentence_signal_score(sentence: str) -> float:
+    s = " " + normalize_fa_text(sentence) + " "
+    score = 0.0
+    priority_hits = sum(1 for k in SUMMARIZER_PRIORITY_KEYWORDS if k in s)
+    request_hits = sum(1 for k in SUMMARIZER_REQUEST_KEYWORDS if k in s)
+    score += min(0.30, priority_hits * 0.07)
+    score += min(0.24, request_hits * 0.08)
+    if "?" in sentence or "؟" in sentence:
+        score += 0.08
+    if re.search(r"\b(\d{1,4}|[۰-۹]{1,4})\b", sentence):
+        score += 0.14
+    if re.search(r"[\w\.-]+@[\w\.-]+\.\w{2,}", sentence):
+        score += 0.22
+    if re.search(r"https?://|www\.", sentence):
+        score += 0.16
+    if re.search(r"\b(آقای|خانم|Mr|Mrs|CEO|مدیر عامل|بانک|شرکت)\b", sentence, flags=re.IGNORECASE):
+        score += 0.10
+    if len(sentence) > 180:
+        score -= 0.06
+    return max(0.0, score)
+
+
+def _extract_sensitive_facts(text: str) -> list[str]:
+    src = _prepare_summary_text(text)
+    if not src:
+        return []
+    out: list[str] = []
+    emails = re.findall(r"[\w\.-]+@[\w\.-]+\.\w{2,}", src)
+    if emails:
+        out.append("ایمیل/تماس: " + " | ".join(sorted(set(emails))[:3]))
+    amounts = re.findall(
+        r"(?:\d[\d,\.]*|[۰-۹][۰-۹,\.]*)\s*(?:دلار|یورو|تومان|ریال|usd|eur|dollar|dollars|percent|٪|%)",
+        src,
+        flags=re.IGNORECASE,
+    )
+    if amounts:
+        out.append("مبالغ/درصدها: " + " | ".join(sorted(set(amounts))[:4]))
+    years = re.findall(r"\b(?:19|20)\d{2}\b|[۱۲۳۴۵۶۷۸۹۰]{4}", src)
+    if years:
+        out.append("سال/تاریخ: " + " | ".join(sorted(set(years))[:5]))
+    if re.search(r"\b(وارث|حساب|بانک|سپرده|تراکنش|تقسیم|محرمانه)\b", normalize_fa_text(src)):
+        out.append("موضوع حساس: درخواست مالی/انتقال حساب/محرمانگی")
+    return out[:3]
 
 
 def _normalize_score_map(scores: dict[int, float]) -> dict[int, float]:
@@ -2762,6 +2850,7 @@ def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int
     stopwords = FACTCHECK_FA_STOPWORDS if lang == "fa" else FACTCHECK_EN_STOPWORDS
     token_freq: Counter[str] = Counter()
     sent_tokens: list[list[str]] = []
+    signal_scores: dict[int, float] = {}
     for s in sentences:
         toks = _sentence_tokens(s, stopwords)
         sent_tokens.append(toks)
@@ -2780,16 +2869,23 @@ def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int
         pos_boost = 0.98 if idx == 0 else (0.92 if idx <= 2 else 0.80)
         len_penalty = 0.88 if len(sentences[idx]) > 190 else 1.0
         base_scores[idx] = base * num_boost * name_boost * list_boost * question_boost * pos_boost * len_penalty
+        signal_scores[idx] = _sentence_signal_score(sentences[idx])
 
     # Keep list-like conversational structure when present (e.g., مقام اول/دوم/سوم).
     list_like = [i for i, s in enumerate(sentences) if re.search(r"\b(مقام|اول|دوم|سوم|چهارم|پنجم)\b", normalize_fa_text(s))]
     question_like = [i for i, s in enumerate(sentences) if ("?" in s or "؟" in s)]
     base_norm = _normalize_score_map(base_scores)
     tr_norm = _textrank_sentence_scores(sentences, sent_tokens)
+    sig_norm = _normalize_score_map(signal_scores)
     final_scores: dict[int, float] = {}
     for idx in range(len(sentences)):
         list_hint = 0.12 if idx in list_like else 0.0
-        final_scores[idx] = (0.62 * base_norm.get(idx, 0.0)) + (0.32 * tr_norm.get(idx, 0.0)) + list_hint
+        final_scores[idx] = (
+            (0.52 * base_norm.get(idx, 0.0))
+            + (0.28 * tr_norm.get(idx, 0.0))
+            + (0.20 * sig_norm.get(idx, 0.0))
+            + list_hint
+        )
 
     if len(sentences) >= 8:
         keep_n = min(max_sentences, 5)
@@ -2817,6 +2913,15 @@ def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int
         if len(ordered_idx) < keep_n + 1:
             ordered_idx.append(qidx)
             ordered_idx = sorted(set(ordered_idx))
+    # Preserve at least one highly-signaled factual sentence.
+    if signal_scores:
+        top_signal = sorted(signal_scores.keys(), key=lambda i: signal_scores.get(i, 0.0), reverse=True)
+        for idx in top_signal[:2]:
+            if signal_scores.get(idx, 0.0) < 0.22:
+                continue
+            if idx not in ordered_idx and len(ordered_idx) < keep_n + 1:
+                ordered_idx.append(idx)
+        ordered_idx = sorted(set(ordered_idx))
 
     summary_chunks = [_shrink_clause(sentences[i], max_chars=122) for i in ordered_idx[:5]]
     summary = " ".join([c for c in summary_chunks if c]).strip()
@@ -2827,11 +2932,21 @@ def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int
     selected_freq: Counter[str] = Counter()
     for i in ordered_idx:
         selected_freq.update(sent_tokens[i])
-    key_terms = [k for k, v in selected_freq.most_common(10) if len(k) >= 3 and v >= 1][:5]
+    key_terms = [
+        k
+        for k, v in selected_freq.most_common(12)
+        if len(k) >= 3 and v >= 1 and k not in SUMMARIZER_EXTRA_STOPWORDS and k not in stopwords
+    ][:5]
+    sensitive_facts = _extract_sensitive_facts(source)
 
     lines = ["📝 خلاصه", summary, "", "🔹 نکات کلیدی"]
     for p in points:
         lines.append(f"• {p}")
+    if sensitive_facts:
+        lines.append("")
+        lines.append("📎 فکت‌های مهم")
+        for fact in sensitive_facts:
+            lines.append(f"• {fact}")
     if key_terms:
         lines.append("")
         lines.append("🏷 کلیدواژه‌ها: " + " | ".join(key_terms))
