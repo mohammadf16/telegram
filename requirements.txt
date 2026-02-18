@@ -4,5 +4,5 @@ pyTelegramBotAPI==4.23.0
 beautifulsoup4==4.12.3
 lxml==5.1.0
 gunicorn==22.0.0
-langchain-core==0.3.37
-langchain-openai==0.3.7
+langchain-core==0.2.43
+langchain-openai==0.1.25
