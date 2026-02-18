@@ -267,6 +267,10 @@ def _default_group_config() -> dict[str, Any]:
         "pin_report": False,
         "mention_enabled": True,
         "cooldown_sec": 20,
+        "ai_enabled": True,
+        "ai_reply_only": False,
+        "ai_daily_limit": 50,
+        "ai_output_tokens": 1000,
     }
 
 
@@ -856,7 +860,7 @@ def get_global_config() -> dict[str, Any]:
         return GLOBAL_SETTINGS
 
 
-def _group_ai_usage_state() -> tuple[str, int, dict[str, int]]:
+def _group_ai_usage_state() -> tuple[str, dict[str, int]]:
     today = today_key_tehran()
     cfg = get_global_config()
     should_save = False
@@ -865,33 +869,49 @@ def _group_ai_usage_state() -> tuple[str, int, dict[str, int]]:
             cfg["group_ai_day"] = today
             cfg["group_ai_counts"] = {}
             should_save = True
-        limit = int(cfg.get("group_ai_daily_limit", 50))
         counts = cfg.setdefault("group_ai_counts", {})
     if should_save:
         save_global_settings()
-    return today, limit, counts
+    return today, counts
+
+
+def get_group_ai_limit(chat_id: int | None = None) -> int:
+    gcfg = get_global_config()
+    base = int(gcfg.get("group_ai_daily_limit", 50))
+    if chat_id is None:
+        return max(1, min(500, base))
+    cfg = get_group_config(chat_id)
+    value = int(cfg.get("ai_daily_limit", base))
+    return max(1, min(500, value))
 
 
 def get_group_ai_usage(chat_id: int) -> tuple[int, int]:
-    _, limit, counts = _group_ai_usage_state()
+    _, counts = _group_ai_usage_state()
     used = int(counts.get(str(chat_id), 0))
+    limit = get_group_ai_limit(chat_id)
     return used, max(1, limit)
 
 
 def consume_group_ai_usage(chat_id: int) -> tuple[int, int]:
-    _, limit, counts = _group_ai_usage_state()
+    _, counts = _group_ai_usage_state()
     key = str(chat_id)
     used = 0
     with SETTINGS_LOCK:
         used = int(counts.get(key, 0)) + 1
         counts[key] = used
     save_global_settings()
+    limit = get_group_ai_limit(chat_id)
     return used, max(1, limit)
 
 
-def get_group_ai_output_tokens() -> int:
-    cfg = get_global_config()
-    value = int(cfg.get("group_ai_max_output_tokens", 1000))
+def get_group_ai_output_tokens(chat_id: int | None = None) -> int:
+    gcfg = get_global_config()
+    base = int(gcfg.get("group_ai_max_output_tokens", 1000))
+    if chat_id is None:
+        value = base
+    else:
+        cfg = get_group_config(chat_id)
+        value = int(cfg.get("ai_output_tokens", base))
     return max(200, min(2000, value))
 
 
@@ -1334,7 +1354,12 @@ def run_ai_chat(message, user_text: str, force_new: bool = False) -> bool:
 
     group_used = 0
     group_limit = 0
+    group_cfg: dict[str, Any] | None = None
     if is_group_chat(message):
+        group_cfg = get_group_config(message.chat.id)
+        if not group_cfg.get("ai_enabled", True):
+            bot.reply_to(message, "چت هوش مصنوعی برای این گروه خاموش است.")
+            return True
         group_used, group_limit = get_group_ai_usage(message.chat.id)
         if group_used >= group_limit:
             bot.reply_to(
@@ -1365,7 +1390,7 @@ def run_ai_chat(message, user_text: str, force_new: bool = False) -> bool:
 
     history.append({"role": "user", "text": prompt})
     history = _trim_ai_thread(history)
-    token_budget = get_group_ai_output_tokens()
+    token_budget = get_group_ai_output_tokens(message.chat.id if is_group_chat(message) else None)
     answer = _normalize_ai_output(call_ai_chat_model(history, max_output_tokens=token_budget))
     if not answer:
         retry_history = _trim_ai_thread(history, max_items=6)
@@ -1400,9 +1425,17 @@ def maybe_handle_ai_text_message(message) -> bool:
     text = (message.text or "").strip()
     if not text:
         return False
+    group_cfg: dict[str, Any] | None = None
+    if is_group_chat(message):
+        group_cfg = get_group_config(message.chat.id)
+        if not group_cfg.get("ai_enabled", True):
+            return False
 
     if _is_reply_to_ai_message(message):
         return run_ai_chat(message, text, force_new=False)
+
+    if is_group_chat(message) and bool((group_cfg or {}).get("ai_reply_only", False)):
+        return False
 
     normalized = normalize_fa_text(text)
     if normalized.startswith("هوش "):
@@ -1596,9 +1629,179 @@ def _state_dot(enabled: bool) -> str:
     return "🟢" if enabled else "⚫"
 
 
+def _group_market_settings_text(cfg: dict[str, Any], chat_id: int) -> str:
+    return (
+        "╭─────────────── ✦\n"
+        "│  💱 تنظیمات بازار و ارسال\n"
+        "├───────────────\n"
+        f"│  {_state_dot(cfg.get('enabled', True))} ربات: {'فعال' if cfg.get('enabled', True) else 'غیرفعال'}\n"
+        f"│  {_state_dot(cfg.get('auto_enabled', False))} ارسال خودکار: {'روشن' if cfg.get('auto_enabled', False) else 'خاموش'}\n"
+        f"│  {_state_dot(cfg.get('show_percent', True))} نمایش درصد تغییر: {'روشن' if cfg.get('show_percent', True) else 'خاموش'}\n"
+        f"│  {_state_dot(cfg.get('include_crypto', False))} کریپتو: {'روشن' if cfg.get('include_crypto', False) else 'خاموش'}\n"
+        f"│  {_state_dot(cfg.get('pin_report', False))} پین گزارش: {'روشن' if cfg.get('pin_report', False) else 'خاموش'}\n"
+        f"│  {_state_dot(cfg.get('mention_enabled', True))} پاسخ منشن: {'روشن' if cfg.get('mention_enabled', True) else 'خاموش'}\n"
+        f"│  {_state_dot(cfg.get('silent', False))} بی‌صدا: {'روشن' if cfg.get('silent', False) else 'خاموش'}\n"
+        f"│  ⏳ بازه ارسال: هر {cfg.get('interval_min', 30)} دقیقه\n"
+        f"│  🧊 کول‌داون تریگر: {cfg.get('cooldown_sec', 20)} ثانیه\n"
+        f"│  🎯 تریگر: {cfg.get('trigger', '!prices')}\n"
+        f"│  🏷 عنوان گزارش: {cfg.get('title', '📊 گزارش قیمت')}\n"
+        "│  ✏️ تغییر تریگر: /set_group_cmd !yourcmd\n"
+        "│  ✏️ تغییر عنوان: /set_title متن دلخواه\n"
+        "╰─────────────── ✦"
+    )
+
+
+def _group_ai_settings_text(chat_id: int) -> str:
+    cfg = get_group_config(chat_id)
+    used, limit = get_group_ai_usage(chat_id)
+    remaining = max(0, limit - used)
+    out_tokens = get_group_ai_output_tokens(chat_id)
+    return (
+        "╭─────────────── ✦\n"
+        "│  🤖 تنظیمات هوش مصنوعی گروه\n"
+        "├───────────────\n"
+        f"│  {_state_dot(cfg.get('ai_enabled', True))} AI گروه: {'فعال' if cfg.get('ai_enabled', True) else 'غیرفعال'}\n"
+        f"│  {_state_dot(cfg.get('ai_reply_only', False))} فقط با ریپلای: {'روشن' if cfg.get('ai_reply_only', False) else 'خاموش'}\n"
+        f"│  📊 مصرف امروز: {used}/{limit}\n"
+        f"│  📉 باقی‌مانده امروز: {remaining}\n"
+        f"│  🧠 سقف خروجی هر پاسخ: {out_tokens} توکن\n"
+        "╰─────────────── ✦"
+    )
+
+
+def _group_data_settings_text(chat_id: int) -> str:
+    scores = get_score_map(chat_id)
+    expenses = get_expense_state(chat_id)
+    archive = get_archive_map(chat_id)
+    return (
+        "╭─────────────── ✦\n"
+        "│  🗂 مدیریت داده‌های گروه\n"
+        "├───────────────\n"
+        f"│  🎭 تعداد رکورد امتیاز: {len(scores)}\n"
+        f"│  💰 تعداد خرج‌ها: {len(expenses.get('entries', []))}\n"
+        f"│  💳 اعضای تسویه: {len(expenses.get('participants', {}))}\n"
+        f"│  📂 کلیدهای آرشیو: {len(archive)}\n"
+        "│\n"
+        "│  ریست هر بخش فقط همان بخش را پاک می‌کند.\n"
+        "│  ریست کامل، تنظیمات بازار/AI را به پیش‌فرض برمی‌گرداند.\n"
+        "╰─────────────── ✦"
+    )
+
+
+def _group_settings_page_text(cfg: dict[str, Any], chat_id: int, page: str) -> str:
+    if page == "market":
+        return _group_market_settings_text(cfg, chat_id)
+    if page == "ai":
+        return _group_ai_settings_text(chat_id)
+    if page == "data":
+        return _group_data_settings_text(chat_id)
+    if page == "reco":
+        return reco_settings_text(chat_id)
+    return group_settings_text(cfg, chat_id=chat_id)
+
+
 def _group_settings_markup(cfg: dict[str, Any], chat_id: int, page: str = "main"):
     reco = get_reco_config(chat_id)
     kb = types.InlineKeyboardMarkup(row_width=2)
+    if page == "ai":
+        used, limit = get_group_ai_usage(chat_id)
+        out_tokens = get_group_ai_output_tokens(chat_id)
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{_state_dot(cfg.get('ai_enabled', True))} AI گروه",
+                callback_data="gs:ai:toggle_enabled",
+            ),
+            types.InlineKeyboardButton(
+                f"{_state_dot(cfg.get('ai_reply_only', False))} فقط ریپلای",
+                callback_data="gs:ai:toggle_reply_only",
+            ),
+        )
+        kb.add(
+            types.InlineKeyboardButton(
+                f"⏪ لیمیت -5 ({limit})",
+                callback_data="gs:ai:limit_minus",
+            ),
+            types.InlineKeyboardButton("⏩ لیمیت +5", callback_data="gs:ai:limit_plus"),
+        )
+        kb.add(
+            types.InlineKeyboardButton(
+                f"⏪ خروجی -100 ({out_tokens})",
+                callback_data="gs:ai:output_minus",
+            ),
+            types.InlineKeyboardButton("⏩ خروجی +100", callback_data="gs:ai:output_plus"),
+        )
+        kb.add(
+            types.InlineKeyboardButton(f"🧮 ریست مصرف ({used})", callback_data="gs:ai:reset_usage"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("⬅️ بازگشت", callback_data="gs:page:main"),
+            types.InlineKeyboardButton("❌ بستن پنل", callback_data="gs:close"),
+        )
+        return kb
+
+    if page == "data":
+        kb.add(
+            types.InlineKeyboardButton("🧹 ریست امتیازها", callback_data="gs:data:reset_scores"),
+            types.InlineKeyboardButton("🧾 ریست خرج/دنگ", callback_data="gs:data:reset_expenses"),
+        )
+        kb.add(types.InlineKeyboardButton("📂 ریست آرشیو", callback_data="gs:data:reset_archive"))
+        kb.add(
+            types.InlineKeyboardButton("♻️ ریست کامل تنظیمات", callback_data="gs:data:reset_all"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("⬅️ بازگشت", callback_data="gs:page:main"),
+            types.InlineKeyboardButton("❌ بستن پنل", callback_data="gs:close"),
+        )
+        return kb
+
+    if page == "market":
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{_state_dot(cfg.get('enabled', True))} ربات", callback_data="gs:t:enabled"
+            ),
+            types.InlineKeyboardButton(
+                f"{_state_dot(cfg.get('auto_enabled', False))} خودکار", callback_data="gs:t:auto"
+            ),
+        )
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{_state_dot(cfg.get('show_percent', True))} درصد تغییر",
+                callback_data="gs:t:percent",
+            ),
+            types.InlineKeyboardButton(
+                f"{_state_dot(cfg.get('include_crypto', False))} کریپتو",
+                callback_data="gs:t:crypto",
+            ),
+        )
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{_state_dot(cfg.get('pin_report', False))} پین گزارش", callback_data="gs:t:pin"
+            ),
+            types.InlineKeyboardButton(
+                f"{_state_dot(cfg.get('mention_enabled', True))} پاسخ منشن",
+                callback_data="gs:t:mention",
+            ),
+        )
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{_state_dot(cfg.get('silent', False))} بی‌صدا", callback_data="gs:t:silent"
+            ),
+            types.InlineKeyboardButton("🚀 ارسال فوری", callback_data="gs:send_now"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("⏪ بازه -5", callback_data="gs:n:interval_minus"),
+            types.InlineKeyboardButton("⏩ بازه +5", callback_data="gs:n:interval_plus"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("⏪ کول‌داون -5", callback_data="gs:n:cooldown_minus"),
+            types.InlineKeyboardButton("⏩ کول‌داون +5", callback_data="gs:n:cooldown_plus"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("⬅️ بازگشت", callback_data="gs:page:main"),
+            types.InlineKeyboardButton("❌ بستن پنل", callback_data="gs:close"),
+        )
+        return kb
+
     if page == "reco":
         kb.add(
             types.InlineKeyboardButton(
@@ -1632,52 +1835,14 @@ def _group_settings_markup(cfg: dict[str, Any], chat_id: int, page: str = "main"
         return kb
 
     kb.add(
-        types.InlineKeyboardButton(
-            f"{_state_dot(cfg.get('enabled', True))} ربات", callback_data="gs:t:enabled"
-        ),
-        types.InlineKeyboardButton(
-            f"{_state_dot(cfg.get('auto_enabled', False))} خودکار", callback_data="gs:t:auto"
-        ),
-    )
-    kb.add(
-        types.InlineKeyboardButton(
-            f"{_state_dot(cfg.get('include_crypto', False))} کریپتو",
-            callback_data="gs:t:crypto",
-        ),
-        types.InlineKeyboardButton(
-            f"{_state_dot(cfg.get('pin_report', False))} پین گزارش", callback_data="gs:t:pin"
-        ),
-    )
-    kb.add(
-        types.InlineKeyboardButton(
-            f"{_state_dot(cfg.get('mention_enabled', True))} منشن پاسخ",
-            callback_data="gs:t:mention",
-        ),
-        types.InlineKeyboardButton(
-            f"{_state_dot(cfg.get('silent', False))} بی‌صدا", callback_data="gs:t:silent"
-        ),
-    )
-    kb.add(
-        types.InlineKeyboardButton("⏪ بازه -5", callback_data="gs:n:interval_minus"),
-        types.InlineKeyboardButton("⏩ بازه +5", callback_data="gs:n:interval_plus"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("⏪ کول‌داون -5", callback_data="gs:n:cooldown_minus"),
-        types.InlineKeyboardButton("⏩ کول‌داون +5", callback_data="gs:n:cooldown_plus"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("🚀 ارسال فوری", callback_data="gs:send_now"),
+        types.InlineKeyboardButton("💱 بازار و ارسال", callback_data="gs:page:market"),
         types.InlineKeyboardButton("🎬 پیشنهاد روزانه", callback_data="gs:page:reco"),
     )
     kb.add(
-        types.InlineKeyboardButton("♻️ بازنشانی تنظیمات", callback_data="gs:reset"),
-        types.InlineKeyboardButton("❌ بستن پنل", callback_data="gs:close"),
+        types.InlineKeyboardButton("🤖 هوش مصنوعی گروه", callback_data="gs:page:ai"),
+        types.InlineKeyboardButton("🗂 داده‌ها و ریست", callback_data="gs:page:data"),
     )
-    kb.add(
-        types.InlineKeyboardButton("🧹 ریست امتیازها", callback_data="gs:reset_scores"),
-        types.InlineKeyboardButton("🧾 ریست خرج/دنگ", callback_data="gs:reset_expenses"),
-    )
-    kb.add(types.InlineKeyboardButton("📂 ریست آرشیو", callback_data="gs:reset_archive"))
+    kb.add(types.InlineKeyboardButton("❌ بستن پنل", callback_data="gs:close"))
     return kb
 
 
@@ -2009,6 +2174,13 @@ def group_settings_text(cfg: dict[str, Any], chat_id: int | None = None) -> str:
     if (reco_cfg or {}).get("send_book", False):
         reco_types.append("کتاب")
     reco_mode = "، ".join(reco_types) if reco_types else "هیچکدام"
+    ai_status = "نامشخص"
+    ai_limit = "-"
+    ai_out = "-"
+    if chat_id is not None:
+        ai_status = "روشن" if cfg.get("ai_enabled", True) else "خاموش"
+        ai_limit = str(get_group_ai_limit(chat_id))
+        ai_out = str(get_group_ai_output_tokens(chat_id))
 
     return (
         "╭─────────────── ✦\n"
@@ -2025,6 +2197,7 @@ def group_settings_text(cfg: dict[str, Any], chat_id: int | None = None) -> str:
         f"│  🎯 تریگر: {cfg.get('trigger', '!prices')}\n"
         f"│  🏷 عنوان: {cfg.get('title', '📊 گزارش قیمت')}\n"
         f"│  🎬 پیشنهاد روزانه: {reco_status} ({reco_time} | {reco_mode})\n"
+        f"│  🤖 AI گروه: {ai_status} (لیمیت {ai_limit} | خروجی {ai_out})\n"
         "╰─────────────── ✦"
     )
 
@@ -2086,7 +2259,8 @@ def start(message):
         cfg = get_group_config(message.chat.id)
         bot.send_message(
             message.chat.id,
-            group_settings_text(cfg, chat_id=message.chat.id) + "\n\nبرای تغییر سریع از دکمه های زیر استفاده کن.",
+            _group_settings_page_text(cfg, chat_id=message.chat.id, page="main")
+            + "\n\nبرای تغییر هر بخش، صفحه مربوطه را انتخاب کن.",
             reply_markup=_group_settings_markup(cfg, chat_id=message.chat.id, page="main"),
         )
         return
@@ -2168,7 +2342,7 @@ def group_menu(message):
     cfg = get_group_config(message.chat.id)
     bot.send_message(
         message.chat.id,
-        group_settings_text(cfg, chat_id=message.chat.id),
+        _group_settings_page_text(cfg, chat_id=message.chat.id, page="main"),
         reply_markup=_group_settings_markup(cfg, chat_id=message.chat.id, page="main"),
     )
 
@@ -2203,8 +2377,9 @@ def group_settings_callbacks(call):
         return
 
     if len(payload) >= 3 and payload[1] == "page":
-        page = "reco" if payload[2] == "reco" else "main"
+        page = payload[2] if payload[2] in {"main", "market", "reco", "ai", "data"} else "main"
     elif len(payload) >= 3 and payload[1] == "t":
+        page = "market"
         key = payload[2]
         if key == "enabled":
             cfg["enabled"] = not cfg.get("enabled", True)
@@ -2212,6 +2387,8 @@ def group_settings_callbacks(call):
             cfg["auto_enabled"] = not cfg.get("auto_enabled", False)
             if cfg["auto_enabled"]:
                 cfg["last_sent_ts"] = 0
+        elif key == "percent":
+            cfg["show_percent"] = not cfg.get("show_percent", True)
         elif key == "crypto":
             cfg["include_crypto"] = not cfg.get("include_crypto", False)
         elif key == "pin":
@@ -2222,6 +2399,7 @@ def group_settings_callbacks(call):
             cfg["silent"] = not cfg.get("silent", False)
         save_group_settings(GROUP_SETTINGS)
     elif len(payload) >= 3 and payload[1] == "n":
+        page = "market"
         key = payload[2]
         if key == "interval_minus":
             cfg["interval_min"] = max(1, int(cfg.get("interval_min", 30)) - 5)
@@ -2264,7 +2442,35 @@ def group_settings_callbacks(call):
             except Exception as exc:
                 bot.answer_callback_query(call.id, f"خطا: {exc}", show_alert=True)
         save_reco_settings()
+    elif len(payload) >= 3 and payload[1] == "ai":
+        page = "ai"
+        key = payload[2]
+        if key == "toggle_enabled":
+            cfg["ai_enabled"] = not cfg.get("ai_enabled", True)
+            save_group_settings(GROUP_SETTINGS)
+        elif key == "toggle_reply_only":
+            cfg["ai_reply_only"] = not cfg.get("ai_reply_only", False)
+            save_group_settings(GROUP_SETTINGS)
+        elif key == "limit_minus":
+            cfg["ai_daily_limit"] = max(1, int(cfg.get("ai_daily_limit", 50)) - 5)
+            save_group_settings(GROUP_SETTINGS)
+        elif key == "limit_plus":
+            cfg["ai_daily_limit"] = min(500, int(cfg.get("ai_daily_limit", 50)) + 5)
+            save_group_settings(GROUP_SETTINGS)
+        elif key == "output_minus":
+            cfg["ai_output_tokens"] = max(200, int(cfg.get("ai_output_tokens", 1000)) - 100)
+            save_group_settings(GROUP_SETTINGS)
+        elif key == "output_plus":
+            cfg["ai_output_tokens"] = min(2000, int(cfg.get("ai_output_tokens", 1000)) + 100)
+            save_group_settings(GROUP_SETTINGS)
+        elif key == "reset_usage":
+            gcfg = get_global_config()
+            with SETTINGS_LOCK:
+                counts = gcfg.setdefault("group_ai_counts", {})
+                counts[str(chat_id)] = 0
+            save_global_settings()
     elif len(payload) >= 2 and payload[1] == "send_now":
+        page = "market"
         try:
             msg = send_prices_to_chat(
                 chat_id,
@@ -2278,28 +2484,48 @@ def group_settings_callbacks(call):
             save_group_settings(GROUP_SETTINGS)
         except Exception as exc:
             bot.answer_callback_query(call.id, f"خطا: {exc}", show_alert=True)
-    elif len(payload) >= 2 and payload[1] == "reset":
-        with SETTINGS_LOCK:
-            GROUP_SETTINGS[str(chat_id)] = _default_group_config()
-        save_group_settings(GROUP_SETTINGS)
+    elif len(payload) >= 3 and payload[1] == "data":
+        page = "data"
+        data_action = payload[2]
+        if data_action == "reset_all":
+            with SETTINGS_LOCK:
+                GROUP_SETTINGS[str(chat_id)] = _default_group_config()
+            save_group_settings(GROUP_SETTINGS)
+        elif data_action == "reset_scores":
+            with SETTINGS_LOCK:
+                SCORES[str(chat_id)] = {}
+            save_scores()
+        elif data_action == "reset_expenses":
+            with SETTINGS_LOCK:
+                EXPENSES[str(chat_id)] = {"entries": [], "participants": {}}
+            save_expenses()
+        elif data_action == "reset_archive":
+            with SETTINGS_LOCK:
+                ARCHIVE[str(chat_id)] = {}
+            save_archive()
     elif len(payload) >= 2 and payload[1] == "reset_scores":
+        page = "data"
         with SETTINGS_LOCK:
             SCORES[str(chat_id)] = {}
         save_scores()
     elif len(payload) >= 2 and payload[1] == "reset_expenses":
+        page = "data"
         with SETTINGS_LOCK:
             EXPENSES[str(chat_id)] = {"entries": [], "participants": {}}
         save_expenses()
     elif len(payload) >= 2 and payload[1] == "reset_archive":
+        page = "data"
         with SETTINGS_LOCK:
             ARCHIVE[str(chat_id)] = {}
         save_archive()
+    elif len(payload) >= 2 and payload[1] == "reset":
+        page = "data"
+        with SETTINGS_LOCK:
+            GROUP_SETTINGS[str(chat_id)] = _default_group_config()
+        save_group_settings(GROUP_SETTINGS)
 
     try:
-        if page == "reco":
-            text = reco_settings_text(chat_id)
-        else:
-            text = group_settings_text(cfg, chat_id=chat_id)
+        text = _group_settings_page_text(cfg, chat_id=chat_id, page=page)
         bot.edit_message_text(
             text,
             chat_id=chat_id,
@@ -2318,8 +2544,14 @@ def group_settings(message):
     if not is_group_chat(message):
         bot.reply_to(message, "تنظیمات گروه فقط داخل گروه قابل استفاده است.")
         return
+    if not require_group_admin(message):
+        return
     cfg = get_group_config(message.chat.id)
-    bot.reply_to(message, group_settings_text(cfg, chat_id=message.chat.id))
+    bot.send_message(
+        message.chat.id,
+        _group_settings_page_text(cfg, chat_id=message.chat.id, page="main"),
+        reply_markup=_group_settings_markup(cfg, chat_id=message.chat.id, page="main"),
+    )
 
 
 @bot.callback_query_handler(func=lambda call: (call.data or "").startswith("rc:"))
@@ -3188,7 +3420,7 @@ def ai_usage(message):
         return
     used, limit = get_group_ai_usage(message.chat.id)
     remaining = max(0, limit - used)
-    out_tokens = get_group_ai_output_tokens()
+    out_tokens = get_group_ai_output_tokens(message.chat.id)
     bot.reply_to(
         message,
         f"📊 مصرف AI امروز گروه: {used}/{limit}\n"
@@ -3224,7 +3456,7 @@ def owner_groups() -> list[int]:
 def owner_panel_text() -> str:
     groups = owner_groups()
     gcfg = get_global_config()
-    _, daily_limit, counts = _group_ai_usage_state()
+    _, counts = _group_ai_usage_state()
     total_used = sum(int(v) for v in counts.values())
     per_answer_tokens = get_group_ai_output_tokens()
     return (
@@ -3278,7 +3510,7 @@ def owner_group_text(chat_id: int) -> str:
     reco = get_reco_config(chat_id)
     ai_used, ai_limit = get_group_ai_usage(chat_id)
     ai_remaining = max(0, ai_limit - ai_used)
-    ai_tokens = get_group_ai_output_tokens()
+    ai_tokens = get_group_ai_output_tokens(chat_id)
     reco_types = []
     if reco.get("send_movie", False):
         reco_types.append("فیلم")
@@ -3928,7 +4160,7 @@ def menu_buttons(message):
         cfg = get_group_config(message.chat.id)
         bot.send_message(
             message.chat.id,
-            group_settings_text(cfg, chat_id=message.chat.id),
+            _group_settings_page_text(cfg, chat_id=message.chat.id, page="main"),
             reply_markup=_group_settings_markup(cfg, chat_id=message.chat.id, page="main"),
         )
         return
