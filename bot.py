@@ -129,7 +129,8 @@ MARKET_CRYPTO_MAP = {
 NEWS_HTTP_TIMEOUT = max(3, int(os.getenv("NEWS_HTTP_TIMEOUT", "6")))
 NEWS_REFRESH_INTERVAL_MIN = max(10, int(os.getenv("NEWS_REFRESH_INTERVAL_MIN", "60")))
 NEWS_REFRESH_BUDGET_SEC = max(12, int(os.getenv("NEWS_REFRESH_BUDGET_SEC", "55")))
-FACTCHECK_QUERY_MAX = max(1, min(4, int(os.getenv("FACTCHECK_QUERY_MAX", "3"))))
+NEWS_REFRESH_MAX_FEEDS = max(25, int(os.getenv("NEWS_REFRESH_MAX_FEEDS", "85")))
+FACTCHECK_QUERY_MAX = max(2, min(8, int(os.getenv("FACTCHECK_QUERY_MAX", "6"))))
 FACTCHECK_MAX_EVIDENCE = max(4, min(12, int(os.getenv("FACTCHECK_MAX_EVIDENCE", "8"))))
 NEWS_INDEX_KEEP_DAYS = max(7, int(os.getenv("NEWS_INDEX_KEEP_DAYS", "30")))
 
@@ -229,14 +230,79 @@ NEWS_SOURCE_FEEDS_GLOBAL: list[dict[str, str]] = [
     {"name": "Politico", "url": "https://www.politico.com/rss/politicopicks.xml", "region": "intl", "lang": "en", "tier": "medium"},
 ]
 
-NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE: list[dict[str, str]] = NEWS_SOURCE_FEEDS_GLOBAL[:50]
-NEWS_SOURCE_FEEDS: list[dict[str, str]] = NEWS_SOURCE_FEEDS_IR + NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE
+NEWS_GLOBAL_SITE_DOMAINS: list[str] = [
+    "axios.com", "reuters.com", "apnews.com", "bbc.com", "cnn.com", "nytimes.com",
+    "washingtonpost.com", "wsj.com", "bloomberg.com", "ft.com", "economist.com",
+    "theguardian.com", "independent.co.uk", "telegraph.co.uk", "thetimes.co.uk", "skynews.com",
+    "aljazeera.com", "dw.com", "france24.com", "euronews.com", "voanews.com", "npr.org",
+    "cbsnews.com", "nbcnews.com", "abcnews.go.com", "foxnews.com", "cnbc.com", "forbes.com",
+    "businessinsider.com", "time.com", "newsweek.com", "politico.com", "thehill.com",
+    "theatlantic.com", "newyorker.com", "latimes.com", "usatoday.com", "seattletimes.com",
+    "chicagotribune.com", "bostonglobe.com", "globalnews.ca", "cbc.ca", "ctvnews.ca",
+    "thestar.com", "smh.com.au", "theage.com.au", "abc.net.au", "sbs.com.au",
+    "japantimes.co.jp", "scmp.com", "straitstimes.com", "channelnewsasia.com", "thehindu.com",
+    "hindustantimes.com", "timesofindia.indiatimes.com", "indianexpress.com", "dawn.com",
+    "arabnews.com", "haaretz.com", "jpost.com", "aa.com.tr", "tass.com", "xinhua.net",
+    "chinadaily.com.cn", "globaltimes.cn", "koreatimes.co.kr", "koreaherald.com", "nhk.or.jp",
+    "asahi.com", "yomiuri.co.jp", "mainichi.jp", "elpais.com", "lemonde.fr", "lefigaro.fr",
+    "liberation.fr", "corriere.it", "repubblica.it", "ansa.it", "spiegel.de", "faz.net",
+    "sueddeutsche.de", "tagesspiegel.de", "elmundo.es", "abc.es", "infobae.com", "clarin.com",
+    "folha.uol.com.br", "estadao.com.br", "globo.com", "uol.com.br", "afp.com", "upi.com",
+    "guardian.ng", "allafrica.com", "news24.com", "alarabiya.net", "middleeasteye.net",
+    "iranintl.com", "albawaba.com", "nikkei.com", "jiji.com", "kompas.com", "tempo.co",
+    "jakartapost.com", "manilatimes.net", "inquirer.net", "rappler.com", "tribune.com.pk",
+    "thenews.com.pk", "detik.com", "vietnamnews.vn", "bangkokpost.com", "nationthailand.com",
+]
+
+NEWS_SOURCE_FEEDS_GLOBAL_SITE: list[dict[str, str]] = []
+for _domain in NEWS_GLOBAL_SITE_DOMAINS:
+    _d = _domain.strip().lower()
+    if not _d:
+        continue
+    _q_site = quote_plus(f"site:{_d}")
+    NEWS_SOURCE_FEEDS_GLOBAL_SITE.append(
+        {
+            "name": f"Site { _d } US",
+            "url": f"https://news.google.com/rss/search?q={_q_site}&hl=en-US&gl=US&ceid=US:en",
+            "region": "intl",
+            "lang": "en",
+            "tier": "medium",
+        }
+    )
+    NEWS_SOURCE_FEEDS_GLOBAL_SITE.append(
+        {
+            "name": f"Site { _d } GB",
+            "url": f"https://news.google.com/rss/search?q={_q_site}&hl=en-GB&gl=GB&ceid=GB:en",
+            "region": "intl",
+            "lang": "en",
+            "tier": "medium",
+        }
+    )
+
+
+def _dedupe_news_feeds(feeds: list[dict[str, str]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for feed in feeds:
+        url = str(feed.get("url", "")).strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        out.append(feed)
+    return out
+
+
+NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE: list[dict[str, str]] = _dedupe_news_feeds(
+    NEWS_SOURCE_FEEDS_GLOBAL + NEWS_SOURCE_FEEDS_GLOBAL_SITE
+)
+NEWS_SOURCE_FEEDS: list[dict[str, str]] = _dedupe_news_feeds(NEWS_SOURCE_FEEDS_IR + NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE)
 
 SOURCE_TIER_NAME_HINTS = {
     "reuters": "high",
     "associated press": "high",
     "ap news": "high",
     "bbc": "high",
+    "axios": "high",
     "irna": "high",
     "isna": "high",
     "the guardian": "high",
@@ -342,6 +408,7 @@ AI_MESSAGE_TO_THREAD: dict[str, str] = {}
 AI_LAST_THREAD_BY_CHAT: dict[str, str] = {}
 NEWS_LOCK = threading.Lock()
 NEWS_LAST_REFRESH_TS = 0
+NEWS_FEED_CURSOR = 0
 DB_READY = False
 
 NEGATIVE_REPLY_KEYWORDS = ("کسشر شناسایی شد", "کسشر", "چرت بود", "مزخرف بود")
@@ -1173,6 +1240,19 @@ def db_prune_news_index(keep_days: int = NEWS_INDEX_KEEP_DAYS) -> None:
             conn.close()
 
 
+def _news_feed_batch(feeds: list[dict[str, str]], max_count: int) -> list[dict[str, str]]:
+    global NEWS_FEED_CURSOR
+    if not feeds:
+        return []
+    cap = max(1, min(max_count, len(feeds)))
+    if len(feeds) <= cap:
+        return list(feeds)
+    start = NEWS_FEED_CURSOR % len(feeds)
+    batch = [feeds[(start + i) % len(feeds)] for i in range(cap)]
+    NEWS_FEED_CURSOR = (start + cap) % len(feeds)
+    return batch
+
+
 def refresh_news_index(force: bool = False) -> dict[str, Any]:
     global NEWS_LAST_REFRESH_TS
     now_ts = int(time.time())
@@ -1185,7 +1265,8 @@ def refresh_news_index(force: bool = False) -> dict[str, Any]:
         start_ts = time.time()
         total_inserted = 0
         used_feeds = 0
-        for feed in NEWS_SOURCE_FEEDS:
+        feed_batch = _news_feed_batch(NEWS_SOURCE_FEEDS, NEWS_REFRESH_MAX_FEEDS)
+        for feed in feed_batch:
             if not force and (time.time() - start_ts) > NEWS_REFRESH_BUDGET_SEC:
                 break
             items = _fetch_rss_items(feed.get("url", ""), source_meta=feed, max_items=35)
@@ -1334,9 +1415,12 @@ def _extract_json_payload(raw: str) -> str:
     if txt.startswith("```"):
         txt = re.sub(r"^```(?:json)?", "", txt).strip()
         txt = re.sub(r"```$", "", txt).strip()
-    m = re.search(r"(\[[\s\S]+\])", txt)
-    if m:
-        return m.group(1)
+    arr = re.search(r"(\[[\s\S]+\])", txt)
+    if arr:
+        return arr.group(1)
+    obj = re.search(r"(\{[\s\S]+\})", txt)
+    if obj:
+        return obj.group(1)
     return txt
 
 
@@ -1545,6 +1629,8 @@ def _score_factcheck(
             "refute_count": 0,
             "related_count": 0,
             "source_count": 0,
+            "score_reason": "no_evidence",
+            "score_why": "هیچ سند خبری مرتبطی با آستانه شباهت لازم پیدا نشد؛ امتیاز به صورت خنثی 50/50 تنظیم شد.",
         }
 
     now_ts = int(time.time())
@@ -1622,6 +1708,20 @@ def _score_factcheck(
             verdict = "نیازمند بررسی بیشتر"
 
     scored.sort(key=lambda x: abs(float(x.get("effect", 0.0))), reverse=True)
+    score_reason = "scored"
+    score_why = "امتیاز بر اساس شواهد موافق/مخالف، اعتبار منبع، تازگی خبر و شباهت محتوایی محاسبه شد."
+    if len([s for s in seen_sources if s]) == 0 or (support_count + refute_count + related_count) == 0:
+        score_reason = "no_evidence"
+        score_why = "سند مستقیم کافی پیدا نشد؛ نتیجه عددی خنثی/کم‌اطمینان است."
+    elif support_count > 0 and refute_count > 0:
+        score_reason = "conflicting_evidence"
+        score_why = "شواهد معتبر هم‌زمان موافق و مخالف وجود دارد؛ نتیجه نهایی با اطمینان پایین‌تر گزارش شد."
+    elif confidence < 0.35:
+        score_reason = "low_confidence"
+        score_why = "تعداد یا کیفیت شواهد برای نتیجه قطعی کافی نبود."
+    elif abs(truth_prob - 0.5) <= 0.08:
+        score_reason = "near_balanced"
+        score_why = "وزن شواهد نزدیک به تعادل است و نتیجه قطعی به دست نیامده است."
     return {
         "verdict": verdict,
         "truth_prob": truth_prob,
@@ -1632,6 +1732,8 @@ def _score_factcheck(
         "refute_count": refute_count,
         "related_count": related_count,
         "source_count": len([s for s in seen_sources if s]),
+        "score_reason": score_reason,
+        "score_why": score_why,
     }
 
 
@@ -1644,20 +1746,31 @@ def _fmt_news_date(ts: int | None) -> str:
         return "--"
 
 
+def _normalize_claim_seed(text: str) -> str:
+    src = _clean_html_text(text or "")
+    if not src:
+        return ""
+    src = src.replace("🔴", " ").replace("🟡", " ").replace("🟢", " ")
+    src = re.sub(r"#\S+", " ", src)
+    src = re.sub(r"\s+", " ", src).strip()
+    return src
+
+
 def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
-    raw_text = _clean_html_text(text or "")
+    raw_text = _normalize_claim_seed(text or "")
     if not raw_text:
         return {"ok": False, "error": "متن خبر خالی است."}
     check_mode = normalize_text(mode)
     if check_mode not in FACTCHECK_MODES:
         check_mode = "news"
-    use_ai = check_mode == "pro" and bool(OPENAI_API_KEY)
+    allow_ai = bool(OPENAI_API_KEY)
+    use_ai = check_mode == "pro" and allow_ai
 
-    claim = (_ai_distill_claim(raw_text) if use_ai else "") or raw_text[:420]
+    claim = (_ai_distill_claim(raw_text) if use_ai else "") or raw_text[:520]
     claim = " ".join(claim.split())[:500]
     lang = _guess_news_lang(claim)
     translated = ""
-    if use_ai:
+    if allow_ai:
         if lang == "fa":
             translated = _ai_translate_fact_text(claim, "en")
         elif lang == "en":
@@ -1666,11 +1779,22 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
     queries: list[str] = [claim]
     if translated and normalize_text(translated) != normalize_text(claim):
         queries.append(translated)
+    norm_claim = normalize_text(claim)
+    norm_raw = normalize_text(raw_text)
+    if "axios" in norm_claim or "axios" in norm_raw:
+        site_query = f"site:axios.com {(translated or claim)}"
+        queries.append(site_query[:240])
     keywords = _extract_fact_keywords(claim, limit=7)
     if keywords:
         keyword_query = " ".join(keywords)
         if keyword_query and keyword_query not in queries:
             queries.append(keyword_query)
+    if translated:
+        en_keywords = _extract_fact_keywords(translated, limit=6)
+        if en_keywords:
+            en_query = " ".join(en_keywords)
+            if en_query and en_query not in queries:
+                queries.append(en_query)
     # Keep the search compact to avoid long user wait.
     uniq_queries: list[str] = []
     for q in queries:
@@ -1686,7 +1810,7 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
     if fetched:
         db_upsert_news_items(fetched)
 
-    search_terms = _extract_fact_keywords(" ".join(uniq_queries), limit=10)
+    search_terms = _extract_fact_keywords(" ".join(uniq_queries + [claim, translated]), limit=16)
     local_candidates = db_search_news_candidates(search_terms, limit=260)
     ranked: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1708,10 +1832,11 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
         ),
         reverse=True,
     )
-    selected = ranked[: max(FACTCHECK_MAX_EVIDENCE * 2, 12)]
-    ai_labels = _ai_label_evidence(claim, selected[:FACTCHECK_MAX_EVIDENCE]) if use_ai else {}
-    scored = _score_factcheck(claim, selected[:FACTCHECK_MAX_EVIDENCE], ai_labels)
-    top_evidence = scored.get("evidence", [])[:FACTCHECK_MAX_EVIDENCE]
+    mode_evidence_limit = 4 if check_mode == "brief" else (10 if check_mode == "news" else FACTCHECK_MAX_EVIDENCE)
+    selected = ranked[: max(mode_evidence_limit * 2, 12)]
+    ai_labels = _ai_label_evidence(claim, selected[:mode_evidence_limit]) if use_ai else {}
+    scored = _score_factcheck(claim, selected[:mode_evidence_limit], ai_labels)
+    top_evidence = scored.get("evidence", [])[:mode_evidence_limit]
     ai_reasoning = _ai_factcheck_reasoning(claim, top_evidence, scored) if use_ai else {}
     return {
         "ok": True,
@@ -1722,6 +1847,7 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
         "translated_claim": translated,
         "queries": uniq_queries,
         "refresh_info": refresh_info,
+        "query_attempts": len(uniq_queries),
         "fetched_count": len(fetched),
         "candidate_count": len(ranked),
         "configured_ir_sources": len(NEWS_SOURCE_FEEDS_IR),
@@ -1746,7 +1872,12 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
     ai_used = bool(result.get("ai_used", False))
     reasoning = result.get("ai_reasoning", {}) if isinstance(result.get("ai_reasoning"), dict) else {}
     ir_count = int(result.get("configured_ir_sources", len(NEWS_SOURCE_FEEDS_IR)))
-    global_count = int(result.get("configured_global_sources", len(NEWS_SOURCE_FEEDS_GLOBAL)))
+    global_count = int(result.get("configured_global_sources", len(NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE)))
+    score_reason = normalize_text(str(result.get("score_reason", "")))
+    score_why = str(result.get("score_why", "")).strip()
+    query_attempts = int(result.get("query_attempts", 0))
+    fetched_count = int(result.get("fetched_count", 0))
+    candidate_count = int(result.get("candidate_count", 0))
 
     lines = [
         "🧪 راستی‌آزمایی خبر",
@@ -1763,7 +1894,12 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
         ),
         f"🌐 تنوع منبع: {int(result.get('source_count', 0))} منبع",
         f"🗂 پایگاه بررسی: {global_count} منبع جهانی + {ir_count} منبع داخلی",
+        f"🔍 تلاش جست‌وجو: {query_attempts} کوئری | سند خام: {fetched_count} | کاندید مرتبط: {candidate_count}",
     ]
+    if score_why:
+        lines.append(f"📌 دلیل امتیاز: {score_why}")
+    if score_reason == "no_evidence":
+        lines.append("📎 چرا 50/50؟ چون هیچ سند کافی پیدا نشد و نتیجه به‌صورت خنثی/کم‌اطمینان گزارش شده است.")
     if translated:
         lang = str(result.get("lang", "unknown"))
         if lang == "fa":
@@ -1808,6 +1944,8 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
     lines.append("🔎 منابع شاخص:")
     label_icon = {"support": "✅", "refute": "❌", "related": "➖", "irrelevant": "▫️"}
     source_limit = 3 if mode == "brief" else 6
+    if not evidence:
+        lines.append("• سند قابل اتکای مستقیمی پیدا نشد (در این اجرا).")
     for idx, item in enumerate(evidence[:source_limit], start=1):
         label = normalize_text(str(item.get("label", "related")))
         icon = label_icon.get(label, "▫️")
@@ -3928,7 +4066,7 @@ def full_guide_text(is_group: bool = False) -> str:
         "• یا مستقیم: /summarize متن\n"
         "• خلاصه‌سازی کاملا با موتور داخلی خود ربات انجام می‌شود (بدون API).\n\n"
         "4) راستی‌آزمایی خبر\n"
-        "• حالت اخبار (پایگاه گسترده 50 جهانی + 10 داخلی): /fact_news یا /factcheck\n"
+        "• حالت اخبار (پایگاه گسترده 200+ جهانی + 10 داخلی): /fact_news یا /factcheck\n"
         "• حالت خیلی خلاصه: /cred_short\n"
         "• حالت پیشرفته AI + تحلیل جزءبه‌جزء + منابع شماره‌دار: /fact_pro\n"
         "• خروجی: درصد احتمال واقعی/فیک + منابع شاخص + جمع‌بندی\n\n"
@@ -5611,7 +5749,7 @@ def factcheck_news(message):
     status = bot.reply_to(
         message,
         "🔎 در حال فکت‌سنجی اخبار...\n"
-        "• بررسی گسترده در 50 منبع جهانی + 10 منبع داخلی\n"
+        "• بررسی گسترده در 200+ منبع جهانی + 10 منبع داخلی\n"
         "• جست‌وجو در Google/Bing News RSS\n"
         "• امتیازدهی موافق/مخالف و جمع‌بندی سندمحور",
     )
@@ -5683,6 +5821,7 @@ def factcheck_news_pro(message):
         message,
         "🧪 در حال راستی‌آزمایی پیشرفته...\n"
         "• تحلیل خبر با هوش مصنوعی + مدل‌سازی شواهد\n"
+        "• ترجمه ادعای فارسی برای چک در منابع بین‌المللی\n"
         "• استخراج فکت‌های جزئی و تناقض‌ها\n"
         "• ارائه سند، لینک و استدلال جزءبه‌جزء",
     )
