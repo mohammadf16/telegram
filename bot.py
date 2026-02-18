@@ -45,6 +45,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano").strip()
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").strip().rstrip("/")
 DEBUG_SAVE_MSG = os.getenv("DEBUG_SAVE_MSG", "1").strip() in ("1", "true", "on", "yes")
+AI_DEBUG = os.getenv("AI_DEBUG", "1").strip().lower() in ("1", "true", "on", "yes")
 RUN_MODE = os.getenv(
     "RUN_MODE", "webhook" if os.getenv("RAILWAY_ENVIRONMENT") else "polling"
 ).strip().lower()
@@ -737,6 +738,13 @@ def log_save_msg_debug(payload: str) -> None:
     print(f"[save_msg {ts}] {payload}")
 
 
+def log_ai_debug(payload: str) -> None:
+    if not AI_DEBUG:
+        return
+    ts = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[ai {ts}] {payload}")
+
+
 def is_for_this_bot(command_text: str) -> bool:
     cmd = normalize_text(command_text)
     if "@" not in cmd:
@@ -1152,6 +1160,7 @@ def maybe_send_daily_recommendations() -> None:
 
 def call_recommendation_model(prompt: str, max_output_tokens: int = 300) -> str:
     if not OPENAI_API_KEY:
+        log_ai_debug("OPENAI_API_KEY is empty; skipping model call.")
         return ""
     url = f"{OPENAI_API_BASE}/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -1162,12 +1171,22 @@ def call_recommendation_model(prompt: str, max_output_tokens: int = 300) -> str:
     }
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=25)
-        res.raise_for_status()
+        if res.status_code >= 400:
+            log_ai_debug(f"OpenAI API HTTP {res.status_code}: {res.text[:500]}")
+            return ""
         data = res.json()
         text = data.get("output_text")
         if isinstance(text, str) and text.strip():
             return text.strip()
-    except Exception:
+        log_ai_debug(f"OpenAI response missing output_text. keys={list(data.keys())[:12]}")
+    except requests.Timeout:
+        log_ai_debug("OpenAI API request timed out.")
+        return ""
+    except requests.RequestException as exc:
+        log_ai_debug(f"OpenAI API request error: {exc}")
+        return ""
+    except Exception as exc:
+        log_ai_debug(f"OpenAI response parse error: {exc}")
         return ""
     return ""
 
@@ -1300,6 +1319,11 @@ def run_ai_chat(message, user_text: str, force_new: bool = False) -> bool:
     history = _trim_ai_thread(history)
     answer = _normalize_ai_output(call_ai_chat_model(history))
     if not answer:
+        log_ai_debug(
+            "AI chat returned empty output "
+            f"(chat_id={message.chat.id}, user_id={message.from_user.id}, "
+            f"is_group={is_group_chat(message)}, prompt_len={len(prompt)})"
+        )
         bot.reply_to(message, "پاسخ AI موقتاً در دسترس نیست. چند لحظه بعد دوباره تلاش کن.")
         return True
 
