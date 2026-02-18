@@ -136,6 +136,13 @@ FACTCHECK_RECENT_DAYS = max(3, int(os.getenv("FACTCHECK_RECENT_DAYS", "120")))
 LIVE_SEARCH_ENABLED = os.getenv("LIVE_SEARCH_ENABLED", "1").strip().lower() in ("1", "true", "on", "yes")
 LIVE_SEARCH_MAX_RESULTS = max(4, min(40, int(os.getenv("LIVE_SEARCH_MAX_RESULTS", "16"))))
 LIVE_FETCH_MAX_ARTICLES = max(0, min(20, int(os.getenv("LIVE_FETCH_MAX_ARTICLES", "6"))))
+FACTCHECK_AI_WEBSEARCH_ENABLED = os.getenv("FACTCHECK_AI_WEBSEARCH_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "on",
+    "yes",
+)
+FACTCHECK_AI_WEBSEARCH_MAX_SOURCES = max(2, min(10, int(os.getenv("FACTCHECK_AI_WEBSEARCH_MAX_SOURCES", "6"))))
 NEWS_INDEX_KEEP_DAYS = max(7, int(os.getenv("NEWS_INDEX_KEEP_DAYS", "30")))
 
 NEWS_REQUEST_HEADERS = {
@@ -2209,6 +2216,9 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
     scored = _score_factcheck(claim, selected[:mode_evidence_limit], ai_labels)
     top_evidence = scored.get("evidence", [])[:mode_evidence_limit]
     ai_reasoning = _ai_factcheck_reasoning(claim, top_evidence, scored) if use_ai else {}
+    ai_web = _ai_factcheck_web_verdict(claim, translated_claim=translated) if (check_mode == "pro" and use_ai) else {}
+    if ai_web:
+        scored = _blend_fact_scores(scored, ai_web)
     recent_candidate_count = len([x for x in ranked if bool(x.get("is_recent", False))])
     return {
         "ok": True,
@@ -2230,6 +2240,7 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
         "configured_ir_sources": len(NEWS_SOURCE_FEEDS_IR),
         "configured_global_sources": len(NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE),
         "ai_reasoning": ai_reasoning,
+        "ai_web": ai_web,
         **scored,
     }
 
@@ -2248,6 +2259,7 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
     mode = normalize_text(str(result.get("mode", "news")))
     ai_used = bool(result.get("ai_used", False))
     reasoning = result.get("ai_reasoning", {}) if isinstance(result.get("ai_reasoning"), dict) else {}
+    ai_web = result.get("ai_web", {}) if isinstance(result.get("ai_web"), dict) else {}
     ir_count = int(result.get("configured_ir_sources", len(NEWS_SOURCE_FEEDS_IR)))
     global_count = int(result.get("configured_global_sources", len(NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE)))
     score_reason = normalize_text(str(result.get("score_reason", "")))
@@ -2330,6 +2342,48 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
             lines.append(f"🧩 شکاف اطلاعاتی: {missing}")
     elif mode == "pro" and not ai_used:
         lines.append("ℹ️ تحلیل پیشرفته AI فعال نشد (کلید API موجود نیست)؛ خروجی با موتور سندی داخلی تولید شد.")
+    if mode == "pro" and ai_used:
+        if ai_web:
+            aiw_verdict = normalize_text(str(ai_web.get("verdict", "uncertain")))
+            aiw_label = {
+                "likely_true": "احتمالاً واقعی",
+                "likely_false": "احتمالاً فیک/گمراه‌کننده",
+                "uncertain": "نامطمئن",
+            }.get(aiw_verdict, "نامطمئن")
+            aiw_truth = int(round(float(ai_web.get("truth_prob", 0.5)) * 100))
+            aiw_conf = int(round(float(ai_web.get("confidence", 0.2)) * 100))
+            lines.append(f"🛰 راستی‌آزمایی وب‌محور AI: {aiw_label} | واقعی {aiw_truth}٪ | اطمینان {aiw_conf}٪")
+            aiw_why = str(ai_web.get("why", "")).strip()
+            if aiw_why:
+                lines.append(f"• تحلیل AI: {aiw_why[:260]}")
+            checks = ai_web.get("checks") if isinstance(ai_web.get("checks"), list) else []
+            if checks:
+                lines.append("• نکات تحلیلی AI:")
+                for item in checks[:4]:
+                    txt = str(item).strip()
+                    if txt:
+                        lines.append(f"  - {txt[:180]}")
+            web_sources = ai_web.get("sources") if isinstance(ai_web.get("sources"), list) else []
+            if web_sources:
+                lines.append("🌐 منابع استنادی AI (وب):")
+                stance_icon = {"support": "✅", "refute": "❌", "related": "➖"}
+                for idx, src in enumerate(web_sources[: FACTCHECK_AI_WEBSEARCH_MAX_SOURCES], start=1):
+                    if not isinstance(src, dict):
+                        continue
+                    st = normalize_text(str(src.get("stance", "related")))
+                    icon = stance_icon.get(st, "➖")
+                    title = str(src.get("title", ""))[:120]
+                    pub = str(src.get("publisher", ""))[:50]
+                    dt = str(src.get("date", "unknown"))[:16]
+                    url = str(src.get("url", ""))[:300]
+                    note = str(src.get("note", "")).strip()[:140]
+                    lines.append(f"{idx}) {icon} [{pub}] ({dt}) {title}")
+                    if note:
+                        lines.append(f"  ↳ {note}")
+                    if url:
+                        lines.append(url)
+        else:
+            lines.append("🛰 راستی‌آزمایی وب‌محور AI: برای این ادعا سند معتبر کافی برنگرداند.")
 
     lines.append("🔎 منابع شاخص:")
     label_icon = {"support": "✅", "refute": "❌", "related": "➖", "irrelevant": "▫️"}
@@ -3053,6 +3107,217 @@ def call_recommendation_model(
         log_ai_debug(f"OpenAI response parse error: {exc}")
         return ""
     return ""
+
+
+def _extract_responses_output_text(data: dict[str, Any]) -> str:
+    if not isinstance(data, dict):
+        return ""
+    text = data.get("output_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    output = data.get("output")
+    if not isinstance(output, list):
+        return ""
+    chunks: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_text = part.get("text")
+            if isinstance(part_text, str) and part_text.strip():
+                chunks.append(part_text.strip())
+    return "\n".join(chunks).strip()
+
+
+def _normalize_fact_url(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("www."):
+        raw = f"https://{raw}"
+    if not raw.startswith("http://") and not raw.startswith("https://"):
+        return ""
+    return _canonical_news_link(raw)
+
+
+def _ai_factcheck_web_verdict(claim: str, translated_claim: str = "") -> dict[str, Any]:
+    if not OPENAI_API_KEY or not FACTCHECK_AI_WEBSEARCH_ENABLED:
+        return {}
+    source_claim = " ".join((claim or "").split()).strip()[:520]
+    if not source_claim:
+        return {}
+    translated = " ".join((translated_claim or "").split()).strip()[:520]
+    prompt = (
+        "You are a strict, evidence-first fact-check analyst.\n"
+        "Use web search tool to find recent, credible sources.\n"
+        "Never output a claim without citation URLs.\n"
+        "Return ONLY JSON object with this exact shape:\n"
+        "{"
+        "\"verdict\":\"likely_true|likely_false|uncertain\","
+        "\"truth_prob\":0-100,"
+        "\"confidence\":0-100,"
+        "\"why\":\"short Persian explanation\","
+        "\"checks\":[\"short Persian bullet\", \"...\"],"
+        "\"sources\":["
+        "{\"title\":\"...\",\"publisher\":\"...\",\"url\":\"https://...\","
+        "\"date\":\"YYYY-MM-DD or unknown\",\"stance\":\"support|refute|related\",\"note\":\"short Persian\"}"
+        "]"
+        "}\n"
+        "Rules:\n"
+        "- Minimum 2 and maximum 8 sources.\n"
+        "- Prefer official outlets and primary reporting.\n"
+        "- If sources conflict, set verdict=uncertain.\n"
+        "- If evidence is weak, lower confidence.\n"
+        "- truth_prob and confidence must be integers.\n\n"
+        f"Claim (original): {source_claim}\n"
+        f"Claim (translation): {translated if translated else 'N/A'}"
+    )
+
+    url = f"{OPENAI_API_BASE}/responses"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload: dict[str, Any] = {
+        "model": OPENAI_MODEL,
+        "input": prompt,
+        "max_output_tokens": 1200,
+        "reasoning": {"effort": "medium"},
+        "tools": [{"type": "web_search_preview"}],
+    }
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=45)
+        if res.status_code >= 400:
+            log_ai_debug(f"OpenAI factcheck web HTTP {res.status_code}: {res.text[:500]}")
+            return {}
+        data = res.json()
+    except Exception as exc:
+        log_ai_debug(f"OpenAI factcheck web error: {exc}")
+        return {}
+
+    raw = _extract_responses_output_text(data)
+    payload_txt = _extract_json_payload(raw)
+    if not payload_txt:
+        return {}
+    try:
+        parsed = json.loads(payload_txt)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    verdict = normalize_text(str(parsed.get("verdict", "uncertain")))
+    if verdict not in ("likely_true", "likely_false", "uncertain"):
+        verdict = "uncertain"
+    try:
+        truth_prob = int(float(parsed.get("truth_prob", 50)))
+    except Exception:
+        truth_prob = 50
+    try:
+        confidence = int(float(parsed.get("confidence", 20)))
+    except Exception:
+        confidence = 20
+    truth_prob = max(1, min(99, truth_prob))
+    confidence = max(1, min(99, confidence))
+    why = str(parsed.get("why", "")).strip()[:420]
+    checks = parsed.get("checks") if isinstance(parsed.get("checks"), list) else []
+    clean_checks = [str(x).strip()[:180] for x in checks if str(x).strip()][:6]
+
+    raw_sources = parsed.get("sources") if isinstance(parsed.get("sources"), list) else []
+    sources: list[dict[str, Any]] = []
+    for item in raw_sources[: FACTCHECK_AI_WEBSEARCH_MAX_SOURCES + 2]:
+        if not isinstance(item, dict):
+            continue
+        link = _normalize_fact_url(str(item.get("url", "")))
+        title = _clean_html_text(str(item.get("title", "")))[:170]
+        publisher = _clean_html_text(str(item.get("publisher", "")))[:70]
+        stance = normalize_text(str(item.get("stance", "related")))
+        if stance not in ("support", "refute", "related"):
+            stance = "related"
+        date_text = normalize_text(str(item.get("date", "unknown")))[:20] or "unknown"
+        note = _clean_html_text(str(item.get("note", "")))[:180]
+        if not link or not title:
+            continue
+        sources.append(
+            {
+                "title": title,
+                "publisher": publisher or (_domain_from_url(link) or "unknown"),
+                "url": link,
+                "date": date_text,
+                "stance": stance,
+                "note": note,
+            }
+        )
+    # Deduplicate and cap.
+    seen_links: set[str] = set()
+    final_sources: list[dict[str, Any]] = []
+    for src in sources:
+        key = normalize_text(src.get("url", ""))
+        if not key or key in seen_links:
+            continue
+        seen_links.add(key)
+        final_sources.append(src)
+        if len(final_sources) >= FACTCHECK_AI_WEBSEARCH_MAX_SOURCES:
+            break
+
+    if len(final_sources) < 2:
+        return {}
+    return {
+        "verdict": verdict,
+        "truth_prob": truth_prob / 100.0,
+        "fake_prob": 1.0 - (truth_prob / 100.0),
+        "confidence": confidence / 100.0,
+        "why": why,
+        "checks": clean_checks,
+        "sources": final_sources,
+    }
+
+
+def _blend_fact_scores(internal: dict[str, Any], ai_web: dict[str, Any]) -> dict[str, Any]:
+    if not ai_web:
+        return internal
+    try:
+        ai_truth = float(ai_web.get("truth_prob", 0.5))
+        ai_conf = float(ai_web.get("confidence", 0.2))
+    except Exception:
+        return internal
+    if len(ai_web.get("sources") or []) < 2:
+        return internal
+
+    base_truth = float(internal.get("truth_prob", 0.5))
+    base_conf = float(internal.get("confidence", 0.2))
+    blend_weight = 0.22 + (0.28 * max(0.0, min(1.0, ai_conf)))
+    merged_truth = ((1.0 - blend_weight) * base_truth) + (blend_weight * ai_truth)
+    merged_truth = max(0.02, min(0.98, merged_truth))
+    merged_fake = 1.0 - merged_truth
+    merged_conf = max(base_conf, (0.75 * base_conf) + (0.25 * ai_conf))
+    merged_conf = max(0.10, min(0.98, merged_conf))
+
+    merged_verdict = "نامطمئن"
+    if merged_conf >= 0.45:
+        if merged_truth >= 0.65:
+            merged_verdict = "احتمالاً واقعی"
+        elif merged_truth <= 0.35:
+            merged_verdict = "احتمالاً فیک/گمراه‌کننده"
+        else:
+            merged_verdict = "نیازمند بررسی بیشتر"
+
+    out = dict(internal)
+    out["truth_prob"] = merged_truth
+    out["fake_prob"] = merged_fake
+    out["confidence"] = merged_conf
+    out["verdict"] = merged_verdict
+    base_why = str(out.get("score_why", "")).strip()
+    ai_why = str(ai_web.get("why", "")).strip()
+    if ai_why:
+        if base_why:
+            out["score_why"] = f"{base_why} | تحلیل وب‌محور AI: {ai_why}"
+        else:
+            out["score_why"] = f"تحلیل وب‌محور AI: {ai_why}"
+    out["score_reason"] = "blended_with_ai_web"
+    return out
 
 
 AI_SYSTEM_PROMPT = (
@@ -4513,7 +4778,7 @@ def full_guide_text(is_group: bool = False) -> str:
         "4) راستی‌آزمایی خبر\n"
         "• حالت اخبار (پایگاه 200+ جهانی + 10 داخلی + جست‌وجوی زنده وب): /fact_news یا /factcheck\n"
         "• حالت خیلی خلاصه: /cred_short\n"
-        "• حالت پیشرفته AI + تحلیل جزءبه‌جزء + منابع شماره‌دار: /fact_pro\n"
+        "• حالت پیشرفته AI + تحلیل جزءبه‌جزء + فکت‌چک وب‌محور با لینک منبع: /fact_pro\n"
         "• خروجی: درصد احتمال واقعی/فیک + دلیل امتیاز + منابع شاخص + جمع‌بندی\n\n"
         "5) خرج و دنگ گروهی\n"
         "• ثبت خرج: /add 480 پیتزا\n"
@@ -6267,6 +6532,7 @@ def factcheck_news_pro(message):
         "🧪 در حال راستی‌آزمایی پیشرفته...\n"
         "• تحلیل خبر با هوش مصنوعی + مدل‌سازی شواهد\n"
         "• بازیابی ترکیبی: RSS + جست‌وجوی زنده وب\n"
+        "• فکت‌چک وب‌محور با OpenAI و منابع لینک‌دار\n"
         "• ترجمه ادعای فارسی برای چک در منابع بین‌المللی\n"
         "• استخراج فکت‌های جزئی و تناقض‌ها\n"
         "• ارائه سند، لینک و استدلال جزءبه‌جزء",
