@@ -849,7 +849,7 @@ def get_global_config() -> dict[str, Any]:
         GLOBAL_SETTINGS.setdefault("gpt_daily_limit", 5)
         GLOBAL_SETTINGS.setdefault("gpt_day", "")
         GLOBAL_SETTINGS.setdefault("gpt_daily_count", 0)
-        GLOBAL_SETTINGS.setdefault("group_ai_daily_limit", 20)
+        GLOBAL_SETTINGS.setdefault("group_ai_daily_limit", 50)
         GLOBAL_SETTINGS.setdefault("group_ai_day", "")
         GLOBAL_SETTINGS.setdefault("group_ai_counts", {})
         GLOBAL_SETTINGS.setdefault("group_ai_max_output_tokens", 1000)
@@ -865,7 +865,7 @@ def _group_ai_usage_state() -> tuple[str, int, dict[str, int]]:
             cfg["group_ai_day"] = today
             cfg["group_ai_counts"] = {}
             should_save = True
-        limit = int(cfg.get("group_ai_daily_limit", 20))
+        limit = int(cfg.get("group_ai_daily_limit", 50))
         counts = cfg.setdefault("group_ai_counts", {})
     if should_save:
         save_global_settings()
@@ -1322,8 +1322,9 @@ def _continue_thread_from_reply(message) -> tuple[str | None, list[dict[str, str
     return fallback_thread, [{"role": "assistant", "text": clean_assistant}]
 
 
-def _send_ai_reply(message, text: str):
-    return bot.reply_to(message, f"🤖 پاسخ هوش مصنوعی\n\n{text}")
+def _send_ai_reply(message, text: str, footer: str = ""):
+    suffix = f"\n\n{footer.strip()}" if footer.strip() else ""
+    return bot.reply_to(message, f"🤖 پاسخ هوش مصنوعی\n\n{text}{suffix}")
 
 
 def run_ai_chat(message, user_text: str, force_new: bool = False) -> bool:
@@ -1331,12 +1332,14 @@ def run_ai_chat(message, user_text: str, force_new: bool = False) -> bool:
     if not prompt:
         return False
 
+    group_used = 0
+    group_limit = 0
     if is_group_chat(message):
-        used, limit = get_group_ai_usage(message.chat.id)
-        if used >= limit:
+        group_used, group_limit = get_group_ai_usage(message.chat.id)
+        if group_used >= group_limit:
             bot.reply_to(
                 message,
-                f"⛔️ سهمیه روزانه چت AI این گروه پر شده ({used}/{limit}). فردا دوباره فعال می‌شود.",
+                f"⛔️ سهمیه روزانه چت AI این گروه پر شده ({group_used}/{group_limit}). فردا دوباره فعال می‌شود.",
             )
             return True
 
@@ -1379,7 +1382,11 @@ def run_ai_chat(message, user_text: str, force_new: bool = False) -> bool:
 
     history.append({"role": "assistant", "text": answer})
     history = _trim_ai_thread(history)
-    sent = _send_ai_reply(message, answer)
+    footer = ""
+    if is_group_chat(message):
+        remaining = max(0, group_limit - (group_used + 1))
+        footer = f"📊 باقی‌مانده سهمیه AI امروز گروه: {remaining}/{group_limit}"
+    sent = _send_ai_reply(message, answer, footer=footer)
 
     AI_THREADS[thread_id] = history
     AI_LAST_THREAD_BY_CHAT[str(message.chat.id)] = thread_id
@@ -3225,7 +3232,7 @@ def owner_panel_text() -> str:
         f"• تعداد گروه‌ها: {len(groups)}\n"
         f"• فایل دیتابیس: {DB_PATH}\n"
         f"• مدل پیشنهاد: {OPENAI_MODEL}\n"
-        f"• لیمیت روزانه AI هر گروه: {int(gcfg.get('group_ai_daily_limit', 20))}\n"
+        f"• لیمیت روزانه AI هر گروه: {int(gcfg.get('group_ai_daily_limit', 50))}\n"
         f"• سقف خروجی هر پاسخ AI: {per_answer_tokens} توکن\n"
         f"• مصرف کل AI امروز (همه گروه‌ها): {total_used}\n"
         "یک گروه را از دکمه‌ها انتخاب کن."
@@ -3238,7 +3245,7 @@ def owner_panel_markup():
     gcfg = get_global_config()
     kb.add(
         types.InlineKeyboardButton(
-            f"AI Limit -5 ({int(gcfg.get('group_ai_daily_limit', 20))})",
+            f"AI Limit -5 ({int(gcfg.get('group_ai_daily_limit', 50))})",
             callback_data="ow:ai:limit_minus",
         ),
         types.InlineKeyboardButton(
@@ -3388,7 +3395,7 @@ def set_gpt_limit(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        bot.reply_to(message, "فرمت: /set_gpt_limit 20")
+        bot.reply_to(message, "فرمت: /set_gpt_limit 50")
         return
     try:
         limit = int(parts[1].strip())
@@ -3455,9 +3462,9 @@ def owner_panel_callbacks(call):
         notice = "به‌روزرسانی شد"
         with SETTINGS_LOCK:
             if key == "limit_minus":
-                cfg["group_ai_daily_limit"] = max(1, int(cfg.get("group_ai_daily_limit", 20)) - 5)
+                cfg["group_ai_daily_limit"] = max(1, int(cfg.get("group_ai_daily_limit", 50)) - 5)
             elif key == "limit_plus":
-                cfg["group_ai_daily_limit"] = min(500, int(cfg.get("group_ai_daily_limit", 20)) + 5)
+                cfg["group_ai_daily_limit"] = min(500, int(cfg.get("group_ai_daily_limit", 50)) + 5)
             elif key == "out_minus":
                 cfg["group_ai_max_output_tokens"] = max(200, int(cfg.get("group_ai_max_output_tokens", 1000)) - 100)
             elif key == "out_plus":
