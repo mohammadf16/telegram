@@ -129,7 +129,7 @@ REMINDER_DRAFTS: dict[str, dict[str, Any]] = {}
 REMINDER_DRAFT_COUNTER = 0
 
 NEGATIVE_REPLY_KEYWORDS = ("کسشر شناسایی شد", "کسشر", "چرت بود", "مزخرف بود")
-POSITIVE_REPLY_KEYWORDS = ("جمله طلایی", "خفن بود", "عالی بود", "دمت گرم")
+POSITIVE_REPLY_KEYWORDS = ("شاهکار","جمله طلایی", "خفن بود", "عالی بود", "دمت گرم")
 
 DAILY_MOVIES = [
     (
