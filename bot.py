@@ -271,6 +271,9 @@ def _default_group_config() -> dict[str, Any]:
         "ai_reply_only": False,
         "ai_daily_limit": 50,
         "ai_output_tokens": 1000,
+        "smart_forward_enabled": False,
+        "smart_forward_channels": [],
+        "smart_forward_keywords": [],
     }
 
 
@@ -733,6 +736,45 @@ def normalize_fa_text(text: str | None) -> str:
     for ch in (".", "!", "?", "؟", "،", ",", ":", ";", "؛", "\"", "'", "(", ")", "[", "]"):
         s = s.replace(ch, " ")
     return " ".join(s.split())
+
+
+def _normalize_channel_ref(value: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if v.startswith("@"):
+        return v.lower()
+    if v.startswith("-100") and v[1:].isdigit():
+        return v
+    if v.startswith("-") and v[1:].isdigit():
+        return v
+    if v.isdigit():
+        return v
+    return "@" + v.lower()
+
+
+def _channel_keys_from_chat(chat) -> set[str]:
+    keys: set[str] = set()
+    if chat is None:
+        return keys
+    cid = getattr(chat, "id", None)
+    if cid is not None:
+        keys.add(str(int(cid)))
+    username = (getattr(chat, "username", "") or "").strip()
+    if username:
+        keys.add("@" + username.lower().lstrip("@"))
+    return keys
+
+
+def _text_matches_keywords(text: str, keywords: list[str]) -> bool:
+    src = normalize_fa_text(text)
+    if not src:
+        return False
+    for kw in keywords:
+        needle = normalize_fa_text(kw)
+        if needle and needle in src:
+            return True
+    return False
 
 
 def log_save_msg_debug(payload: str) -> None:
@@ -2225,6 +2267,13 @@ def help_text() -> str:
         "/expenses\n"
         "/split\n"
         "/clear_expenses\n\n"
+        "📡 فوروارد هوشمند کانال:\n"
+        "/fw_on | /fw_off\n"
+        "/fw_add_channel @channel یا -100...\n"
+        "/fw_del_channel @channel\n"
+        "/fw_add_keyword کلمه یا عبارت\n"
+        "/fw_del_keyword کلمه یا عبارت\n"
+        "/fw_list\n\n"
         "📂 آرشیو گروه:\n"
         "/save کلید | مقدار\n"
         "/get کلید\n"
@@ -2287,6 +2336,9 @@ def group_settings_text(cfg: dict[str, Any], chat_id: int | None = None) -> str:
         ai_status = "روشن" if cfg.get("ai_enabled", True) else "خاموش"
         ai_limit = str(get_group_ai_limit(chat_id))
         ai_out = str(get_group_ai_output_tokens(chat_id))
+    fw_status = "روشن" if cfg.get("smart_forward_enabled", False) else "خاموش"
+    fw_channels = len(cfg.get("smart_forward_channels", []) or [])
+    fw_keywords = len(cfg.get("smart_forward_keywords", []) or [])
 
     return (
         "╭─────────────── ✦\n"
@@ -2304,6 +2356,7 @@ def group_settings_text(cfg: dict[str, Any], chat_id: int | None = None) -> str:
         f"│  🏷 عنوان: {cfg.get('title', '📊 گزارش قیمت')}\n"
         f"│  🎬 پیشنهاد روزانه: {reco_status} ({reco_time} | {reco_mode})\n"
         f"│  🤖 AI گروه: {ai_status} (لیمیت {ai_limit} | خروجی {ai_out})\n"
+        f"│  📡 فوروارد هوشمند: {fw_status} (کانال: {fw_channels} | کلمه: {fw_keywords})\n"
         "╰─────────────── ✦"
     )
 
@@ -2971,6 +3024,130 @@ def group_reset(message):
         message,
         f"تنظیمات گروه به حالت پیش فرض برگشت. بازه: {cfg['interval_min']} دقیقه، تریگر: {cfg['trigger']}",
     )
+
+
+def _smart_forward_text(cfg: dict[str, Any]) -> str:
+    channels = cfg.get("smart_forward_channels", []) or []
+    keywords = cfg.get("smart_forward_keywords", []) or []
+    return (
+        "📡 وضعیت فوروارد هوشمند\n"
+        f"• وضعیت: {'روشن' if cfg.get('smart_forward_enabled', False) else 'خاموش'}\n"
+        f"• تعداد کانال‌ها: {len(channels)}\n"
+        f"• تعداد کلمات: {len(keywords)}\n\n"
+        "کانال‌ها:\n"
+        + ("\n".join(f"• {c}" for c in channels[:30]) if channels else "• ثبت نشده")
+        + "\n\nکلمات:\n"
+        + ("\n".join(f"• {k}" for k in keywords[:30]) if keywords else "• ثبت نشده")
+    )
+
+
+@bot.message_handler(commands=["fw_on"])
+def fw_on(message):
+    if not require_group_admin(message):
+        return
+    cfg = get_group_config(message.chat.id)
+    cfg["smart_forward_enabled"] = True
+    save_group_settings(GROUP_SETTINGS)
+    bot.reply_to(message, "✅ فوروارد هوشمند روشن شد.")
+
+
+@bot.message_handler(commands=["fw_off"])
+def fw_off(message):
+    if not require_group_admin(message):
+        return
+    cfg = get_group_config(message.chat.id)
+    cfg["smart_forward_enabled"] = False
+    save_group_settings(GROUP_SETTINGS)
+    bot.reply_to(message, "⛔️ فوروارد هوشمند خاموش شد.")
+
+
+@bot.message_handler(commands=["fw_add_channel"])
+def fw_add_channel(message):
+    if not require_group_admin(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "فرمت: /fw_add_channel @channel یا -100123...")
+        return
+    ref = _normalize_channel_ref(parts[1])
+    if not ref:
+        bot.reply_to(message, "ورودی کانال معتبر نیست.")
+        return
+    cfg = get_group_config(message.chat.id)
+    items = cfg.setdefault("smart_forward_channels", [])
+    if ref not in items:
+        items.append(ref)
+        save_group_settings(GROUP_SETTINGS)
+    bot.reply_to(message, f"✅ کانال اضافه شد: {ref}")
+
+
+@bot.message_handler(commands=["fw_del_channel"])
+def fw_del_channel(message):
+    if not require_group_admin(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "فرمت: /fw_del_channel @channel")
+        return
+    ref = _normalize_channel_ref(parts[1])
+    cfg = get_group_config(message.chat.id)
+    items = cfg.setdefault("smart_forward_channels", [])
+    if ref in items:
+        items.remove(ref)
+        save_group_settings(GROUP_SETTINGS)
+        bot.reply_to(message, f"🗑 حذف شد: {ref}")
+    else:
+        bot.reply_to(message, "این کانال در لیست نیست.")
+
+
+@bot.message_handler(commands=["fw_add_keyword"])
+def fw_add_keyword(message):
+    if not require_group_admin(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "فرمت: /fw_add_keyword کلمه یا عبارت")
+        return
+    kw = normalize_fa_text(parts[1])[:80]
+    if not kw:
+        bot.reply_to(message, "کلمه معتبر نیست.")
+        return
+    cfg = get_group_config(message.chat.id)
+    items = cfg.setdefault("smart_forward_keywords", [])
+    if kw not in items:
+        items.append(kw)
+        save_group_settings(GROUP_SETTINGS)
+    bot.reply_to(message, f"✅ کلمه اضافه شد: {kw}")
+
+
+@bot.message_handler(commands=["fw_del_keyword"])
+def fw_del_keyword(message):
+    if not require_group_admin(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "فرمت: /fw_del_keyword کلمه")
+        return
+    kw = normalize_fa_text(parts[1])[:80]
+    cfg = get_group_config(message.chat.id)
+    items = cfg.setdefault("smart_forward_keywords", [])
+    if kw in items:
+        items.remove(kw)
+        save_group_settings(GROUP_SETTINGS)
+        bot.reply_to(message, f"🗑 حذف شد: {kw}")
+    else:
+        bot.reply_to(message, "این کلمه در لیست نیست.")
+
+
+@bot.message_handler(commands=["fw_list"])
+def fw_list(message):
+    if not is_group_chat(message):
+        bot.reply_to(message, "این دستور برای گروه است.")
+        return
+    if not require_group_admin(message):
+        return
+    cfg = get_group_config(message.chat.id)
+    bot.reply_to(message, _smart_forward_text(cfg))
 
 
 @bot.message_handler(commands=["scoreboard"])
@@ -4236,6 +4413,39 @@ def mention_reply(message):
                 bot.reply_to(message, quick_msg, parse_mode="Markdown")
         except Exception as e:
             bot.reply_to(message, f"خطا: {e}")
+
+
+@bot.channel_post_handler(func=lambda m: True)
+def smart_forward_channel_post(message):
+    source_keys = _channel_keys_from_chat(getattr(message, "chat", None))
+    if not source_keys:
+        return
+    text = _extract_message_text(message)
+    if not text:
+        return
+
+    with SETTINGS_LOCK:
+        groups = list(GROUP_SETTINGS.items())
+
+    for chat_id_str, cfg in groups:
+        try:
+            target_chat_id = int(chat_id_str)
+        except Exception:
+            continue
+        if not bool(cfg.get("smart_forward_enabled", False)):
+            continue
+        channels = [str(x).strip() for x in (cfg.get("smart_forward_channels", []) or []) if str(x).strip()]
+        if not channels:
+            continue
+        if not any(ch in source_keys for ch in channels):
+            continue
+        keywords = [str(x).strip() for x in (cfg.get("smart_forward_keywords", []) or []) if str(x).strip()]
+        if not keywords or not _text_matches_keywords(text, keywords):
+            continue
+        try:
+            bot.forward_message(target_chat_id, message.chat.id, message.message_id)
+        except Exception as exc:
+            print(f"Smart forward error to {target_chat_id}: {exc}")
 
 
 @bot.message_handler(func=lambda m: not is_command_message(m) and bool((m.text or "").strip()))
