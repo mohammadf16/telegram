@@ -852,6 +852,7 @@ def get_global_config() -> dict[str, Any]:
         GLOBAL_SETTINGS.setdefault("group_ai_daily_limit", 20)
         GLOBAL_SETTINGS.setdefault("group_ai_day", "")
         GLOBAL_SETTINGS.setdefault("group_ai_counts", {})
+        GLOBAL_SETTINGS.setdefault("group_ai_max_output_tokens", 1000)
         return GLOBAL_SETTINGS
 
 
@@ -886,6 +887,12 @@ def consume_group_ai_usage(chat_id: int) -> tuple[int, int]:
         counts[key] = used
     save_global_settings()
     return used, max(1, limit)
+
+
+def get_group_ai_output_tokens() -> int:
+    cfg = get_global_config()
+    value = int(cfg.get("group_ai_max_output_tokens", 1000))
+    return max(200, min(2000, value))
 
 
 def _new_reminder_draft_id() -> str:
@@ -1244,13 +1251,14 @@ def _render_ai_prompt(messages: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def call_ai_chat_model(messages: list[dict[str, str]], max_output_tokens: int = 520) -> str:
+def call_ai_chat_model(messages: list[dict[str, str]], max_output_tokens: int | None = None) -> str:
     if not OPENAI_API_KEY:
         return ""
+    token_budget = max_output_tokens if max_output_tokens is not None else get_group_ai_output_tokens()
     prompt = _render_ai_prompt(messages)
     return call_recommendation_model(
         prompt,
-        max_output_tokens=max_output_tokens,
+        max_output_tokens=token_budget,
         reasoning_effort="low",
     )
 
@@ -1354,10 +1362,12 @@ def run_ai_chat(message, user_text: str, force_new: bool = False) -> bool:
 
     history.append({"role": "user", "text": prompt})
     history = _trim_ai_thread(history)
-    answer = _normalize_ai_output(call_ai_chat_model(history))
+    token_budget = get_group_ai_output_tokens()
+    answer = _normalize_ai_output(call_ai_chat_model(history, max_output_tokens=token_budget))
     if not answer:
         retry_history = _trim_ai_thread(history, max_items=6)
-        answer = _normalize_ai_output(call_ai_chat_model(retry_history, max_output_tokens=760))
+        retry_budget = min(2000, token_budget + 200)
+        answer = _normalize_ai_output(call_ai_chat_model(retry_history, max_output_tokens=retry_budget))
     if not answer:
         log_ai_debug(
             "AI chat returned empty output "
@@ -3170,7 +3180,14 @@ def ai_usage(message):
         bot.reply_to(message, "این دستور مخصوص گروه است.")
         return
     used, limit = get_group_ai_usage(message.chat.id)
-    bot.reply_to(message, f"📊 مصرف AI امروز گروه: {used}/{limit}")
+    remaining = max(0, limit - used)
+    out_tokens = get_group_ai_output_tokens()
+    bot.reply_to(
+        message,
+        f"📊 مصرف AI امروز گروه: {used}/{limit}\n"
+        f"• باقی‌مانده: {remaining}\n"
+        f"• سقف خروجی هر پاسخ: {out_tokens} توکن",
+    )
 
 
 def is_owner(user_id: int) -> bool:
@@ -3200,12 +3217,17 @@ def owner_groups() -> list[int]:
 def owner_panel_text() -> str:
     groups = owner_groups()
     gcfg = get_global_config()
+    _, daily_limit, counts = _group_ai_usage_state()
+    total_used = sum(int(v) for v in counts.values())
+    per_answer_tokens = get_group_ai_output_tokens()
     return (
         "🛡 سوپر پنل ادمین بات\n"
         f"• تعداد گروه‌ها: {len(groups)}\n"
         f"• فایل دیتابیس: {DB_PATH}\n"
         f"• مدل پیشنهاد: {OPENAI_MODEL}\n"
         f"• لیمیت روزانه AI هر گروه: {int(gcfg.get('group_ai_daily_limit', 20))}\n"
+        f"• سقف خروجی هر پاسخ AI: {per_answer_tokens} توکن\n"
+        f"• مصرف کل AI امروز (همه گروه‌ها): {total_used}\n"
         "یک گروه را از دکمه‌ها انتخاب کن."
     )
 
@@ -3213,6 +3235,28 @@ def owner_panel_text() -> str:
 def owner_panel_markup():
     kb = types.InlineKeyboardMarkup(row_width=1)
     groups = owner_groups()
+    gcfg = get_global_config()
+    kb.add(
+        types.InlineKeyboardButton(
+            f"AI Limit -5 ({int(gcfg.get('group_ai_daily_limit', 20))})",
+            callback_data="ow:ai:limit_minus",
+        ),
+        types.InlineKeyboardButton(
+            "AI Limit +5",
+            callback_data="ow:ai:limit_plus",
+        ),
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            f"Output -100 ({get_group_ai_output_tokens()})",
+            callback_data="ow:ai:out_minus",
+        ),
+        types.InlineKeyboardButton(
+            "Output +100",
+            callback_data="ow:ai:out_plus",
+        ),
+    )
+    kb.add(types.InlineKeyboardButton("🧮 ریست مصرف AI امروز", callback_data="ow:ai:reset_today"))
     for gid in groups[:20]:
         kb.add(types.InlineKeyboardButton(f"👥 گروه {gid}", callback_data=f"ow:open:{gid}"))
     kb.add(
@@ -3226,6 +3270,8 @@ def owner_group_text(chat_id: int) -> str:
     cfg = get_group_config(chat_id)
     reco = get_reco_config(chat_id)
     ai_used, ai_limit = get_group_ai_usage(chat_id)
+    ai_remaining = max(0, ai_limit - ai_used)
+    ai_tokens = get_group_ai_output_tokens()
     reco_types = []
     if reco.get("send_movie", False):
         reco_types.append("فیلم")
@@ -3242,7 +3288,9 @@ def owner_group_text(chat_id: int) -> str:
         f"• پیشنهاد روزانه: {'روشن' if reco.get('enabled', False) else 'خاموش'}\n"
         f"• زمان reco: {int(reco.get('hour', 21)):02d}:{int(reco.get('minute', 0)):02d}\n"
         f"• نوع‌های reco: {', '.join(reco_types) if reco_types else 'هیچکدام'}\n"
-        f"• مصرف AI امروز: {ai_used}/{ai_limit}"
+        f"• مصرف AI امروز: {ai_used}/{ai_limit}\n"
+        f"• باقی‌مانده AI امروز: {ai_remaining}\n"
+        f"• سقف خروجی هر پاسخ AI: {ai_tokens} توکن"
     )
 
 
@@ -3347,8 +3395,8 @@ def set_gpt_limit(message):
     except Exception:
         bot.reply_to(message, "عدد معتبر وارد کن.")
         return
-    if limit < 1 or limit > 200:
-        bot.reply_to(message, "بازه مجاز: 1 تا 200")
+    if limit < 1 or limit > 500:
+        bot.reply_to(message, "بازه مجاز: 1 تا 500")
         return
     cfg = get_global_config()
     with SETTINGS_LOCK:
@@ -3399,6 +3447,36 @@ def owner_panel_callbacks(call):
             )
         except Exception:
             pass
+        return
+
+    if action == "ai" and len(data) >= 3:
+        key = data[2]
+        cfg = get_global_config()
+        notice = "به‌روزرسانی شد"
+        with SETTINGS_LOCK:
+            if key == "limit_minus":
+                cfg["group_ai_daily_limit"] = max(1, int(cfg.get("group_ai_daily_limit", 20)) - 5)
+            elif key == "limit_plus":
+                cfg["group_ai_daily_limit"] = min(500, int(cfg.get("group_ai_daily_limit", 20)) + 5)
+            elif key == "out_minus":
+                cfg["group_ai_max_output_tokens"] = max(200, int(cfg.get("group_ai_max_output_tokens", 1000)) - 100)
+            elif key == "out_plus":
+                cfg["group_ai_max_output_tokens"] = min(2000, int(cfg.get("group_ai_max_output_tokens", 1000)) + 100)
+            elif key == "reset_today":
+                cfg["group_ai_day"] = today_key_tehran()
+                cfg["group_ai_counts"] = {}
+                notice = "مصرف امروز AI ریست شد"
+        save_global_settings()
+        try:
+            bot.edit_message_text(
+                owner_panel_text(),
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=owner_panel_markup(),
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, notice)
         return
 
     if action == "open" and len(data) >= 3:
