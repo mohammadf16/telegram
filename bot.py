@@ -13,7 +13,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
-from math import exp
+from math import exp, sqrt
 from typing import Any
 from urllib.parse import quote_plus, urlparse
 
@@ -2561,23 +2561,191 @@ def call_ai_chat_model(messages: list[dict[str, str]], max_output_tokens: int | 
 
 SUMMARIZER_MAX_INPUT_CHARS = max(1500, int(os.getenv("SUMMARIZER_MAX_INPUT_CHARS", "12000")))
 SUMMARIZER_MAX_OUTPUT_CHARS = max(700, int(os.getenv("SUMMARIZER_MAX_OUTPUT_CHARS", "1900")))
+SUMMARIZER_TARGET_RATIO = min(0.40, max(0.12, float(os.getenv("SUMMARIZER_TARGET_RATIO", "0.24"))))
+SUMMARIZER_MIN_TARGET_CHARS = max(120, int(os.getenv("SUMMARIZER_MIN_TARGET_CHARS", "190")))
+SUMMARIZER_MAX_TARGET_CHARS = max(260, int(os.getenv("SUMMARIZER_MAX_TARGET_CHARS", "520")))
+SUMMARIZER_EXTRA_STOPWORDS = {
+    "اون",
+    "خیلی",
+    "مال",
+    "یه",
+    "اینو",
+    "اونو",
+    "دیگه",
+    "همون",
+    "اینور",
+    "اونور",
+    "وقتی",
+    "وقت",
+    "داریم",
+    "داره",
+    "میشه",
+    "میتونی",
+    "میگی",
+    "میگه",
+    "بودن",
+    "بود",
+}
+
+
+def _prepare_summary_text(raw: str) -> str:
+    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    if "<" in text and ">" in text:
+        try:
+            text = BeautifulSoup(text, "lxml").get_text("\n", strip=True)
+        except Exception:
+            text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text).replace("\u200c", " ")
+    lines = []
+    for line in text.split("\n"):
+        clean = " ".join(line.strip().split())
+        if clean:
+            lines.append(clean)
+    return "\n".join(lines).strip()
+
+
+def _shrink_clause(text: str, max_chars: int = 165) -> str:
+    value = " ".join((text or "").split()).strip(" \t-•")
+    if len(value) <= max_chars:
+        return value
+    cut = value[:max_chars]
+    split_pos = max(cut.rfind("،"), cut.rfind(","), cut.rfind("؛"), cut.rfind(" "))
+    if split_pos >= int(max_chars * 0.55):
+        cut = cut[:split_pos]
+    return cut.rstrip(" ،,:;") + "…"
 
 
 def _split_sentences(text: str) -> list[str]:
-    value = " ".join((text or "").split())
-    if not value:
+    raw = (text or "").strip()
+    if not raw:
         return []
-    parts = re.split(r"(?<=[\.\!\?؟؛])\s+|[\r\n]+", value)
     out: list[str] = []
-    for part in parts:
-        p = part.strip(" \t-•")
-        if len(p) >= 2:
-            out.append(p)
-    return out
+    blocks = [b.strip() for b in re.split(r"\n+", raw) if b.strip()]
+    for block in blocks:
+        normalized = " ".join(block.split())
+        if not normalized:
+            continue
+        # Split by end punctuation first.
+        chunks = re.split(r"(?<=[\.\!\?؟؛])\s+", normalized)
+        for chunk in chunks:
+            part = chunk.strip(" \t-•")
+            if not part:
+                continue
+            # If still too long (common in chat text), split by commas/clauses.
+            if len(part) > 230:
+                sub_chunks = re.split(
+                    r"[،,]\s+|(?:\s(?:و|ولی|اما|که|چون|بعد|سپس|تا)\s)|(?<=[😂🤣😅😆😁😄😊🙂🙃😉])\s*",
+                    part,
+                )
+                for sub in sub_chunks:
+                    s = sub.strip(" \t-•")
+                    if len(s) >= 12:
+                        out.append(_shrink_clause(s, max_chars=170))
+            else:
+                out.append(part)
+
+    merged: list[str] = []
+    for part in out:
+        if merged and re.match(r"^(ولی|اما|که|و)\b", normalize_fa_text(part)):
+            merged[-1] = f"{merged[-1]} {part}".strip()
+        else:
+            merged.append(part)
+    return merged[:90]
 
 
-def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int = 4) -> str:
-    source = _clean_html_text(text or "")
+def _sentence_tokens(sentence: str, stopwords: set[str]) -> list[str]:
+    return [
+        t
+        for t in _tokenize_fact_text(sentence)
+        if len(t) >= 3 and t not in stopwords and t not in SUMMARIZER_EXTRA_STOPWORDS
+    ]
+
+
+def _normalize_score_map(scores: dict[int, float]) -> dict[int, float]:
+    if not scores:
+        return {}
+    vals = list(scores.values())
+    mn = min(vals)
+    mx = max(vals)
+    if abs(mx - mn) < 1e-9:
+        return {k: 1.0 for k in scores}
+    return {k: (v - mn) / (mx - mn) for k, v in scores.items()}
+
+
+def _textrank_sentence_scores(sentences: list[str], sent_tokens: list[list[str]]) -> dict[int, float]:
+    n = len(sentences)
+    if n == 0:
+        return {}
+    if n == 1:
+        return {0: 1.0}
+    edges: list[dict[int, float]] = [dict() for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            sim = _text_similarity(sentences[i], sentences[j])
+            if sim < 0.10:
+                continue
+            len_i = max(1, len(sent_tokens[i]))
+            len_j = max(1, len(sent_tokens[j]))
+            len_factor = 2.0 / (sqrt(len_i) + sqrt(len_j))
+            w = max(0.0, sim * len_factor)
+            if w <= 0:
+                continue
+            edges[i][j] = w
+            edges[j][i] = w
+
+    ranks = [1.0 / n for _ in range(n)]
+    damping = 0.85
+    for _ in range(24):
+        new_ranks = [(1.0 - damping) / n for _ in range(n)]
+        for i in range(n):
+            out_sum = sum(edges[i].values())
+            if out_sum <= 1e-9:
+                continue
+            for j, w in edges[i].items():
+                new_ranks[j] += damping * ranks[i] * (w / out_sum)
+        ranks = new_ranks
+    return _normalize_score_map({i: ranks[i] for i in range(n)})
+
+
+def _choose_summary_indexes(
+    sentences: list[str],
+    final_scores: dict[int, float],
+    target_chars: int,
+    keep_cap: int,
+) -> list[int]:
+    if not sentences:
+        return []
+    candidates = sorted(final_scores.keys(), key=lambda i: final_scores.get(i, 0.0), reverse=True)
+    selected: list[int] = []
+    consumed = 0
+    while len(selected) < keep_cap and candidates:
+        best_idx = None
+        best_val = -1e9
+        for idx in candidates:
+            if idx in selected:
+                continue
+            rel = final_scores.get(idx, 0.0)
+            redundancy = 0.0
+            if selected:
+                redundancy = max(_text_similarity(sentences[idx], sentences[s]) for s in selected)
+            mmr = (0.78 * rel) - (0.22 * redundancy)
+            if mmr > best_val:
+                best_val = mmr
+                best_idx = idx
+        if best_idx is None:
+            break
+        est_len = len(_shrink_clause(sentences[best_idx], max_chars=130)) + 1
+        # Keep at least 2 sentences even if over budget.
+        if selected and (consumed + est_len > target_chars) and len(selected) >= 2:
+            break
+        selected.append(best_idx)
+        consumed += est_len
+        candidates.remove(best_idx)
+    return sorted(set(selected))
+
+
+def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int = 5) -> str:
+    source = _prepare_summary_text(text or "")
     if not source:
         return "متنی برای خلاصه‌سازی پیدا نشد."
 
@@ -2586,42 +2754,87 @@ def _extractive_summary_local(text: str, max_sentences: int = 5, max_points: int
         clipped = source[:420].rstrip()
         return f"خلاصه:\n{clipped}"
 
+    if len(sentences) == 1:
+        single = _shrink_clause(sentences[0], max_chars=220)
+        return f"📝 خلاصه\n{single}\n\n🔹 نکات کلیدی\n• {single}"
+
     lang = _guess_news_lang(source)
     stopwords = FACTCHECK_FA_STOPWORDS if lang == "fa" else FACTCHECK_EN_STOPWORDS
     token_freq: Counter[str] = Counter()
     sent_tokens: list[list[str]] = []
     for s in sentences:
-        toks = [t for t in _tokenize_fact_text(s) if len(t) >= 3 and t not in stopwords]
+        toks = _sentence_tokens(s, stopwords)
         sent_tokens.append(toks)
         token_freq.update(toks)
 
-    scored: list[tuple[int, float]] = []
+    base_scores: dict[int, float] = {}
     for idx, toks in enumerate(sent_tokens):
         if not toks:
-            scored.append((idx, 0.0))
+            base_scores[idx] = 0.0
             continue
-        base = sum(token_freq.get(t, 0) for t in toks) / max(1.0, len(toks) * 0.9)
-        pos_boost = 1.0 if idx == 0 else (0.88 if idx <= 2 else 0.70)
-        scored.append((idx, base * pos_boost))
+        base = sum(token_freq.get(t, 0) for t in toks) / max(1.0, len(toks) ** 0.65)
+        num_boost = 1.12 if re.search(r"\d", sentences[idx]) else 1.0
+        name_boost = 1.08 if len(re.findall(r"[A-Za-z\u0600-\u06FF]{3,}", sentences[idx])) >= 5 else 1.0
+        list_boost = 1.22 if re.search(r"\b(مقام|اول|دوم|سوم|چهارم|پنجم)\b", normalize_fa_text(sentences[idx])) else 1.0
+        question_boost = 1.10 if ("?" in sentences[idx] or "؟" in sentences[idx]) else 1.0
+        pos_boost = 0.98 if idx == 0 else (0.92 if idx <= 2 else 0.80)
+        len_penalty = 0.88 if len(sentences[idx]) > 190 else 1.0
+        base_scores[idx] = base * num_boost * name_boost * list_boost * question_boost * pos_boost * len_penalty
 
-    min_keep = 3 if len(sentences) >= 4 else 2
-    keep_n = min(max_sentences, max(min_keep, min(6, len(sentences) // 3 + 1)))
-    top_idx = {0}
-    for idx, _score in sorted(scored, key=lambda x: x[1], reverse=True):
-        top_idx.add(idx)
-        if len(top_idx) >= keep_n:
-            break
+    # Keep list-like conversational structure when present (e.g., مقام اول/دوم/سوم).
+    list_like = [i for i, s in enumerate(sentences) if re.search(r"\b(مقام|اول|دوم|سوم|چهارم|پنجم)\b", normalize_fa_text(s))]
+    question_like = [i for i, s in enumerate(sentences) if ("?" in s or "؟" in s)]
+    base_norm = _normalize_score_map(base_scores)
+    tr_norm = _textrank_sentence_scores(sentences, sent_tokens)
+    final_scores: dict[int, float] = {}
+    for idx in range(len(sentences)):
+        list_hint = 0.12 if idx in list_like else 0.0
+        final_scores[idx] = (0.62 * base_norm.get(idx, 0.0)) + (0.32 * tr_norm.get(idx, 0.0)) + list_hint
 
-    ordered_idx = sorted(top_idx)
-    summary = " ".join(sentences[i] for i in ordered_idx).strip()
-    summary = summary[:900].rstrip()
+    if len(sentences) >= 8:
+        keep_n = min(max_sentences, 5)
+    else:
+        keep_n = min(max_sentences, 4)
+    keep_n = max(2, keep_n)
+
+    target_chars = int(len(source) * SUMMARIZER_TARGET_RATIO)
+    target_chars = max(SUMMARIZER_MIN_TARGET_CHARS, min(SUMMARIZER_MAX_TARGET_CHARS, target_chars))
+    ordered_idx = _choose_summary_indexes(
+        sentences=sentences,
+        final_scores=final_scores,
+        target_chars=target_chars,
+        keep_cap=keep_n,
+    )
+    if list_like:
+        for idx in list_like[:3]:
+            if idx in ordered_idx:
+                continue
+            if len(ordered_idx) < keep_n + 1:
+                ordered_idx.append(idx)
+        ordered_idx = sorted(set(ordered_idx))
+    if question_like and not any(i in ordered_idx for i in question_like):
+        qidx = question_like[0]
+        if len(ordered_idx) < keep_n + 1:
+            ordered_idx.append(qidx)
+            ordered_idx = sorted(set(ordered_idx))
+
+    summary_chunks = [_shrink_clause(sentences[i], max_chars=122) for i in ordered_idx[:5]]
+    summary = " ".join([c for c in summary_chunks if c]).strip()
+    summary = summary[: max(220, target_chars + 80)].rstrip()
 
     point_limit = min(max_points, len(ordered_idx))
-    points = [sentences[i][:180].rstrip() for i in ordered_idx[:point_limit]]
+    points = [_shrink_clause(sentences[i], max_chars=118) for i in ordered_idx[:point_limit]]
+    selected_freq: Counter[str] = Counter()
+    for i in ordered_idx:
+        selected_freq.update(sent_tokens[i])
+    key_terms = [k for k, v in selected_freq.most_common(10) if len(k) >= 3 and v >= 1][:5]
 
     lines = ["📝 خلاصه", summary, "", "🔹 نکات کلیدی"]
     for p in points:
         lines.append(f"• {p}")
+    if key_terms:
+        lines.append("")
+        lines.append("🏷 کلیدواژه‌ها: " + " | ".join(key_terms))
     return "\n".join(lines).strip()
 
 
@@ -2638,7 +2851,7 @@ def _extract_summarize_input_text(message) -> str:
 
 
 def run_text_summarizer(message, source_text: str) -> str:
-    source = _clean_html_text(source_text or "")
+    source = _prepare_summary_text(source_text or "")
     if not source:
         return "⛔️ متن قابل خلاصه‌سازی پیدا نشد."
     if len(source) > SUMMARIZER_MAX_INPUT_CHARS:
