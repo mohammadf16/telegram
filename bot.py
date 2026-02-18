@@ -20,7 +20,7 @@ from telebot import types
 
 app = Flask(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8553449845:AAHqUxxhLIhUBwV4cJH7KGJUSSkv2lBDDQk").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set BOT_TOKEN environment variable before running.")
 
@@ -45,6 +45,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano").strip()
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").strip().rstrip("/")
 DEBUG_SAVE_MSG = os.getenv("DEBUG_SAVE_MSG", "1").strip() in ("1", "true", "on", "yes")
+RUN_MODE = os.getenv(
+    "RUN_MODE", "webhook" if os.getenv("RAILWAY_ENVIRONMENT") else "polling"
+).strip().lower()
+APP_HOST = os.getenv("APP_HOST", "0.0.0.0").strip()
+APP_PORT = int(os.getenv("PORT", "8080"))
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip().rstrip("/")
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
 TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 ITEM_ICON = {
@@ -3514,9 +3521,35 @@ def menu_buttons(message):
 
 @app.route("/" + BOT_TOKEN, methods=["POST"])
 def webhook():
+    if WEBHOOK_SECRET_TOKEN:
+        incoming = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if incoming != WEBHOOK_SECRET_TOKEN:
+            return "Forbidden", 403
     update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
     bot.process_new_updates([update])
     return "OK", 200
+
+
+@app.route("/", methods=["GET"])
+def healthcheck():
+    return "OK", 200
+
+
+def configure_webhook() -> str:
+    if not WEBHOOK_BASE_URL:
+        raise RuntimeError(
+            "WEBHOOK_BASE_URL is not set. Example: https://your-app.up.railway.app"
+        )
+    webhook_url = f"{WEBHOOK_BASE_URL}/{BOT_TOKEN}"
+    bot.remove_webhook()
+    time.sleep(0.5)
+    kwargs: dict[str, Any] = {}
+    if WEBHOOK_SECRET_TOKEN:
+        kwargs["secret_token"] = WEBHOOK_SECRET_TOKEN
+    ok = bot.set_webhook(url=webhook_url, **kwargs)
+    if not ok:
+        raise RuntimeError("Failed to set Telegram webhook.")
+    return webhook_url
 
 
 if __name__ == "__main__":
@@ -3528,5 +3561,12 @@ if __name__ == "__main__":
     scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
     scheduler_thread.start()
 
-    bot.remove_webhook()
-    bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+    if RUN_MODE == "webhook":
+        webhook_url = configure_webhook()
+        print(f"Webhook mode enabled: {webhook_url}")
+        app.run(host=APP_HOST, port=APP_PORT)
+    elif RUN_MODE == "polling":
+        bot.remove_webhook()
+        bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+    else:
+        raise RuntimeError("RUN_MODE must be either 'webhook' or 'polling'.")
