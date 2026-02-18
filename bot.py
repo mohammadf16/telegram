@@ -15,7 +15,7 @@ from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from math import exp, sqrt
 from typing import Any
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse, urlsplit
 
 from flask import Flask, request
 import requests
@@ -132,6 +132,10 @@ NEWS_REFRESH_BUDGET_SEC = max(12, int(os.getenv("NEWS_REFRESH_BUDGET_SEC", "55")
 NEWS_REFRESH_MAX_FEEDS = max(25, int(os.getenv("NEWS_REFRESH_MAX_FEEDS", "85")))
 FACTCHECK_QUERY_MAX = max(2, min(8, int(os.getenv("FACTCHECK_QUERY_MAX", "6"))))
 FACTCHECK_MAX_EVIDENCE = max(4, min(12, int(os.getenv("FACTCHECK_MAX_EVIDENCE", "8"))))
+FACTCHECK_RECENT_DAYS = max(3, int(os.getenv("FACTCHECK_RECENT_DAYS", "120")))
+LIVE_SEARCH_ENABLED = os.getenv("LIVE_SEARCH_ENABLED", "1").strip().lower() in ("1", "true", "on", "yes")
+LIVE_SEARCH_MAX_RESULTS = max(4, min(40, int(os.getenv("LIVE_SEARCH_MAX_RESULTS", "16"))))
+LIVE_FETCH_MAX_ARTICLES = max(0, min(20, int(os.getenv("LIVE_FETCH_MAX_ARTICLES", "6"))))
 NEWS_INDEX_KEEP_DAYS = max(7, int(os.getenv("NEWS_INDEX_KEEP_DAYS", "30")))
 
 NEWS_REQUEST_HEADERS = {
@@ -1316,6 +1320,295 @@ def _fetch_query_news_items(query: str) -> list[dict[str, Any]]:
     return merged
 
 
+def _domain_from_url(url: str) -> str:
+    value = (url or "").strip()
+    if not value:
+        return ""
+    try:
+        netloc = (urlparse(value).netloc or "").lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc
+    except Exception:
+        return ""
+
+
+def _unwrap_search_redirect(raw_url: str) -> str:
+    url = (raw_url or "").strip()
+    if not url:
+        return ""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.netloc or "").lower()
+        if "duckduckgo.com" in host and parsed.path.startswith("/l/"):
+            qs = parse_qs(parsed.query or "")
+            uddg = (qs.get("uddg") or [""])[0]
+            if uddg:
+                return unquote(uddg).strip()
+        if "bing.com" in host and "/news/apiclick.aspx" in parsed.path.lower():
+            qs = parse_qs(parsed.query or "")
+            target = (qs.get("url") or [""])[0]
+            if target:
+                return unquote(target).strip()
+    except Exception:
+        return url
+    return url
+
+
+def _parse_html_datetime(raw: str) -> int | None:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    cleaned = value.replace("Z", "+00:00")
+    try:
+        return int(datetime.fromisoformat(cleaned).timestamp())
+    except Exception:
+        pass
+    return _parse_rss_datetime(value)
+
+
+def _extract_article_metadata(url: str) -> dict[str, Any]:
+    out = {"title": "", "summary": "", "published_ts": None}
+    target = _canonical_news_link(url)
+    if not target:
+        return out
+    try:
+        res = requests.get(target, headers=NEWS_REQUEST_HEADERS, timeout=NEWS_HTTP_TIMEOUT)
+        if res.status_code >= 400 or not res.text:
+            return out
+        soup = BeautifulSoup(res.text, "lxml")
+        title = ""
+        for selector in (
+            "meta[property='og:title']",
+            "meta[name='twitter:title']",
+            "meta[name='title']",
+            "title",
+        ):
+            node = soup.select_one(selector)
+            if node is None:
+                continue
+            value = (node.get("content") if node.name == "meta" else node.get_text(" ", strip=True)) or ""
+            value = _clean_html_text(value)
+            if value:
+                title = value
+                break
+        summary = ""
+        for selector in (
+            "meta[property='og:description']",
+            "meta[name='description']",
+            "meta[name='twitter:description']",
+        ):
+            node = soup.select_one(selector)
+            if node is None:
+                continue
+            value = _clean_html_text(node.get("content") or "")
+            if value:
+                summary = value
+                break
+        published_ts = None
+        for selector in (
+            "meta[property='article:published_time']",
+            "meta[name='pubdate']",
+            "meta[name='publishdate']",
+            "meta[itemprop='datePublished']",
+            "time[datetime]",
+        ):
+            node = soup.select_one(selector)
+            if node is None:
+                continue
+            raw_dt = node.get("content") or node.get("datetime") or node.get_text(" ", strip=True)
+            published_ts = _parse_html_datetime(raw_dt or "")
+            if published_ts:
+                break
+        out["title"] = title[:600]
+        out["summary"] = summary[:1500]
+        out["published_ts"] = published_ts
+        return out
+    except Exception:
+        return out
+
+
+def _fetch_live_search_page(url: str) -> str:
+    try:
+        res = requests.get(url, headers=NEWS_REQUEST_HEADERS, timeout=NEWS_HTTP_TIMEOUT)
+        if res.status_code >= 400:
+            return ""
+        return res.text or ""
+    except Exception:
+        return ""
+
+
+def _parse_ddg_html_results(html_text: str, max_items: int = 12) -> list[dict[str, Any]]:
+    if not html_text.strip():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        soup = BeautifulSoup(html_text, "lxml")
+        nodes = soup.select("a.result__a")
+        for node in nodes[: max_items * 2]:
+            href = _unwrap_search_redirect((node.get("href") or "").strip())
+            title = _clean_html_text(node.get_text(" ", strip=True))
+            if not href or not title:
+                continue
+            parent = node.find_parent("div", class_=re.compile(r"result"))
+            snippet = ""
+            if parent is not None:
+                sn = parent.select_one(".result__snippet")
+                if sn is not None:
+                    snippet = _clean_html_text(sn.get_text(" ", strip=True))
+            source_name = _domain_from_url(href) or "Web"
+            out.append(
+                {
+                    "source": source_name,
+                    "source_region": "mixed",
+                    "source_lang": "unknown",
+                    "source_tier": _infer_source_tier(source_name, fallback="medium"),
+                    "title": title[:600],
+                    "summary": snippet[:1500],
+                    "link": _canonical_news_link(href)[:1200],
+                    "published_ts": None,
+                    "normalized_title": normalize_fa_text(title)[:700],
+                    "fetched_at": int(time.time()),
+                }
+            )
+            if len(out) >= max_items:
+                break
+    except Exception:
+        return out
+    return out
+
+
+def _parse_bing_html_results(html_text: str, max_items: int = 12) -> list[dict[str, Any]]:
+    if not html_text.strip():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        soup = BeautifulSoup(html_text, "lxml")
+        nodes = soup.select("li.news-card, div.news-card, li.b_algo")
+        for node in nodes:
+            a = node.select_one("a[href]")
+            if a is None:
+                continue
+            href = _unwrap_search_redirect((a.get("href") or "").strip())
+            title = _clean_html_text(a.get_text(" ", strip=True))
+            if not href or not title:
+                continue
+            snippet = ""
+            for selector in ("p.snippet", "div.snippet", "div.news-card-snippet", "p"):
+                sn = node.select_one(selector)
+                if sn is not None:
+                    snippet = _clean_html_text(sn.get_text(" ", strip=True))
+                    if snippet:
+                        break
+            source_name = _domain_from_url(href) or "Web"
+            out.append(
+                {
+                    "source": source_name,
+                    "source_region": "mixed",
+                    "source_lang": "unknown",
+                    "source_tier": _infer_source_tier(source_name, fallback="medium"),
+                    "title": title[:600],
+                    "summary": snippet[:1500],
+                    "link": _canonical_news_link(href)[:1200],
+                    "published_ts": None,
+                    "normalized_title": normalize_fa_text(title)[:700],
+                    "fetched_at": int(time.time()),
+                }
+            )
+            if len(out) >= max_items:
+                break
+    except Exception:
+        return out
+    return out
+
+
+def _news_item_timestamp(item: dict[str, Any]) -> int:
+    try:
+        return int(item.get("published_ts") or item.get("fetched_at") or 0)
+    except Exception:
+        return 0
+
+
+def _merge_news_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    index_by_key: dict[str, int] = {}
+    for raw in items:
+        item = dict(raw or {})
+        link = _canonical_news_link(str(item.get("link", "")))[:1200]
+        title = _clean_html_text(str(item.get("title", "")))[:600]
+        if not link and not title:
+            continue
+        item["link"] = link
+        item["title"] = title
+        item["summary"] = _clean_html_text(str(item.get("summary", "")))[:1500]
+        if not item.get("normalized_title"):
+            item["normalized_title"] = normalize_fa_text(title)[:700]
+        if not item.get("source"):
+            item["source"] = _domain_from_url(link) or "Web"
+        if not item.get("source_tier"):
+            item["source_tier"] = _infer_source_tier(str(item.get("source", "")), fallback="medium")
+        if not item.get("fetched_at"):
+            item["fetched_at"] = int(time.time())
+
+        key = normalize_text(link) or f"{normalize_text(item.get('source', ''))}|{normalize_text(title)}"
+        if not key:
+            continue
+
+        existing_idx = index_by_key.get(key)
+        if existing_idx is None:
+            index_by_key[key] = len(merged)
+            merged.append(item)
+            continue
+
+        existing = merged[existing_idx]
+        old_ts = _news_item_timestamp(existing)
+        new_ts = _news_item_timestamp(item)
+        old_text_len = len(str(existing.get("title", ""))) + len(str(existing.get("summary", "")))
+        new_text_len = len(str(item.get("title", ""))) + len(str(item.get("summary", "")))
+        if (new_ts, new_text_len) > (old_ts, old_text_len):
+            merged[existing_idx] = item
+    return merged
+
+
+def _merge_live_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _merge_news_items(items)
+
+
+def _fetch_live_search_items(query: str, max_items: int = LIVE_SEARCH_MAX_RESULTS) -> list[dict[str, Any]]:
+    if not LIVE_SEARCH_ENABLED:
+        return []
+    q = quote_plus((query or "").strip())
+    if not q:
+        return []
+    ddg_url = f"https://duckduckgo.com/html/?q={q}%20news"
+    bing_url = f"https://www.bing.com/news/search?q={q}"
+    merged: list[dict[str, Any]] = []
+    ddg_html = _fetch_live_search_page(ddg_url)
+    if ddg_html:
+        merged.extend(_parse_ddg_html_results(ddg_html, max_items=max_items))
+    bing_html = _fetch_live_search_page(bing_url)
+    if bing_html:
+        merged.extend(_parse_bing_html_results(bing_html, max_items=max_items))
+    merged = _merge_live_items(merged)
+    if LIVE_FETCH_MAX_ARTICLES <= 0:
+        return merged[:max_items]
+
+    # Pull extra metadata directly from article pages for top live links.
+    for item in merged[: min(LIVE_FETCH_MAX_ARTICLES, len(merged))]:
+        meta = _extract_article_metadata(str(item.get("link", "")))
+        if meta.get("title"):
+            item["title"] = str(meta.get("title"))
+            item["normalized_title"] = normalize_fa_text(item["title"])[:700]
+        if meta.get("summary"):
+            item["summary"] = str(meta.get("summary"))
+        if meta.get("published_ts"):
+            try:
+                item["published_ts"] = int(meta["published_ts"])
+            except Exception:
+                pass
+    return merged[:max_items]
+
+
 def _tokenize_fact_text(text: str) -> list[str]:
     if not text:
         return []
@@ -1364,8 +1657,14 @@ def db_search_news_candidates(search_terms: list[str], limit: int = 220) -> list
         try:
             cur = conn.cursor()
             if terms:
-                where = " OR ".join(["normalized_title LIKE ?"] * len(terms))
-                like_params = [f"%{normalize_fa_text(t)}%" for t in terms]
+                where_parts: list[str] = []
+                like_params: list[str] = []
+                for t in terms:
+                    norm_t = f"%{normalize_fa_text(t)}%"
+                    raw_t = f"%{t}%"
+                    where_parts.append("(normalized_title LIKE ? OR title LIKE ? OR summary LIKE ?)")
+                    like_params.extend([norm_t, raw_t, raw_t])
+                where = " OR ".join(where_parts)
                 cur.execute(
                     f"""
                     SELECT source, source_region, source_lang, source_tier, title, summary, link, published_ts, normalized_title, fetched_at
@@ -1602,15 +1901,15 @@ def _heuristic_label(claim: str, item: dict[str, Any], relevance: float) -> tupl
     combined = f"{item.get('title', '')} {item.get('summary', '')}".strip()
     neg_claim = _contains_negation(claim)
     neg_item = _contains_negation(combined)
-    if relevance < 0.20:
-        return "irrelevant", 0.30, "ارتباط واژگانی کم"
-    if relevance >= 0.62:
+    if relevance < 0.14:
+        return "irrelevant", 0.28, "ارتباط واژگانی کم"
+    if relevance >= 0.50:
         if neg_claim != neg_item:
-            return "refute", 0.58, "واژگان تکذیب/رد متفاوت است"
-        return "support", 0.60, "شباهت محتوایی بالا"
-    if relevance >= 0.36:
-        return "related", 0.52, "موضوع مشابه ولی تایید قطعی ندارد"
-    return "irrelevant", 0.35, "ارتباط مستقیم کافی نیست"
+            return "refute", 0.56, "واژگان تکذیب/رد متفاوت است"
+        return "support", 0.58, "شباهت محتوایی بالا"
+    if relevance >= 0.24:
+        return "related", 0.50, "موضوع مشابه ولی تایید قطعی ندارد"
+    return "irrelevant", 0.33, "ارتباط مستقیم کافی نیست"
 
 
 def _score_factcheck(
@@ -1803,41 +2102,114 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
             uniq_queries.append(qq)
     uniq_queries = uniq_queries[:FACTCHECK_QUERY_MAX]
 
+    mode_evidence_limit = 4 if check_mode == "brief" else (10 if check_mode == "news" else FACTCHECK_MAX_EVIDENCE)
     refresh_info = refresh_news_index(force=False)
-    fetched: list[dict[str, Any]] = []
-    for query in uniq_queries:
-        fetched.extend(_fetch_query_news_items(query))
-    if fetched:
-        db_upsert_news_items(fetched)
+    fetched_rss: list[dict[str, Any]] = []
+    fetched_live: list[dict[str, Any]] = []
+    live_query_cap = 1 if check_mode == "brief" else (2 if check_mode == "news" else 3)
+    live_items_per_query = min(
+        LIVE_SEARCH_MAX_RESULTS,
+        8 if check_mode == "brief" else (12 if check_mode == "news" else max(12, LIVE_SEARCH_MAX_RESULTS)),
+    )
+    live_queries_run = 0
+    for idx, query in enumerate(uniq_queries):
+        rss_items = _fetch_query_news_items(query)
+        if rss_items:
+            fetched_rss.extend(rss_items)
+        if LIVE_SEARCH_ENABLED and idx < live_query_cap:
+            live_queries_run += 1
+            live_items = _fetch_live_search_items(query, max_items=live_items_per_query)
+            if live_items:
+                fetched_live.extend(live_items)
 
-    search_terms = _extract_fact_keywords(" ".join(uniq_queries + [claim, translated]), limit=16)
-    local_candidates = db_search_news_candidates(search_terms, limit=260)
+    fetched_combined = _merge_news_items(fetched_rss + fetched_live)
+    if fetched_combined:
+        db_upsert_news_items(fetched_combined)
+
+    search_terms = _extract_fact_keywords(" ".join(uniq_queries + [claim, translated]), limit=20)
+    local_limit = 180 if check_mode == "brief" else (280 if check_mode == "news" else 360)
+    local_candidates = db_search_news_candidates(search_terms, limit=local_limit)
+    candidate_pool = _merge_news_items(fetched_combined + local_candidates)
+    now_ts = int(time.time())
+    recent_cutoff = now_ts - (FACTCHECK_RECENT_DAYS * 86400)
+    claim_signatures: list[str] = []
+    for sig in (
+        claim,
+        " ".join(_extract_fact_keywords(claim, limit=18)),
+        translated,
+        " ".join(_extract_fact_keywords(translated, limit=14)) if translated else "",
+    ):
+        cleaned = " ".join((sig or "").split()).strip()
+        if cleaned and cleaned not in claim_signatures:
+            claim_signatures.append(cleaned)
+    if not claim_signatures:
+        claim_signatures.append(claim)
+
+    def _claim_relevance(evidence_text: str) -> float:
+        return max(_text_similarity(sig, evidence_text) for sig in claim_signatures)
+
     ranked: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in local_candidates:
-        key = f"{normalize_text(item.get('source', ''))}|{normalize_text(item.get('link', ''))}"
-        if key in seen:
+    for item in candidate_pool:
+        key = normalize_text(item.get("link", "")) or (
+            f"{normalize_text(item.get('source', ''))}|{normalize_text(item.get('title', ''))}"
+        )
+        if not key or key in seen:
+            continue
+        combined = f"{item.get('title', '')} {item.get('summary', '')}".strip()
+        relevance = _claim_relevance(combined)
+        if relevance < 0.12:
+            continue
+        published_ts = _news_item_timestamp(item)
+        age_days = max(0.0, (now_ts - published_ts) / 86400.0) if published_ts > 0 else 0.0
+        freshness = 1.0 / (1.0 + (age_days / 14.0))
+        if published_ts > 0 and published_ts < recent_cutoff and relevance < 0.33:
             continue
         seen.add(key)
-        combined = f"{item.get('title', '')} {item.get('summary', '')}".strip()
-        relevance = _text_similarity(claim, combined)
-        if relevance < 0.16:
-            continue
         item["relevance"] = relevance
+        item["rank_score"] = (0.82 * relevance) + (0.18 * freshness)
+        item["age_days"] = round(age_days, 2)
+        item["is_recent"] = bool(published_ts >= recent_cutoff) if published_ts > 0 else False
         ranked.append(item)
+
+    # If strict recency filter removed too much, keep a small relaxed backup set.
+    need_floor = max(8, mode_evidence_limit * 2)
+    if len(ranked) < need_floor:
+        for item in candidate_pool:
+            key = normalize_text(item.get("link", "")) or (
+                f"{normalize_text(item.get('source', ''))}|{normalize_text(item.get('title', ''))}"
+            )
+            if not key or key in seen:
+                continue
+            combined = f"{item.get('title', '')} {item.get('summary', '')}".strip()
+            relevance = _claim_relevance(combined)
+            if relevance < 0.10:
+                continue
+            published_ts = _news_item_timestamp(item)
+            age_days = max(0.0, (now_ts - published_ts) / 86400.0) if published_ts > 0 else 0.0
+            freshness = 1.0 / (1.0 + (age_days / 18.0))
+            seen.add(key)
+            item["relevance"] = relevance
+            item["rank_score"] = (0.86 * relevance) + (0.14 * freshness)
+            item["age_days"] = round(age_days, 2)
+            item["is_recent"] = bool(published_ts >= recent_cutoff) if published_ts > 0 else False
+            ranked.append(item)
+            if len(ranked) >= local_limit:
+                break
+
     ranked.sort(
         key=lambda x: (
-            float(x.get("relevance", 0.0)),
+            float(x.get("rank_score", x.get("relevance", 0.0))),
             int(x.get("published_ts") or x.get("fetched_at") or 0),
         ),
         reverse=True,
     )
-    mode_evidence_limit = 4 if check_mode == "brief" else (10 if check_mode == "news" else FACTCHECK_MAX_EVIDENCE)
     selected = ranked[: max(mode_evidence_limit * 2, 12)]
     ai_labels = _ai_label_evidence(claim, selected[:mode_evidence_limit]) if use_ai else {}
     scored = _score_factcheck(claim, selected[:mode_evidence_limit], ai_labels)
     top_evidence = scored.get("evidence", [])[:mode_evidence_limit]
     ai_reasoning = _ai_factcheck_reasoning(claim, top_evidence, scored) if use_ai else {}
+    recent_candidate_count = len([x for x in ranked if bool(x.get("is_recent", False))])
     return {
         "ok": True,
         "mode": check_mode,
@@ -1848,8 +2220,13 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
         "queries": uniq_queries,
         "refresh_info": refresh_info,
         "query_attempts": len(uniq_queries),
-        "fetched_count": len(fetched),
+        "fetched_count": len(fetched_combined),
+        "fetched_rss_count": len(fetched_rss),
+        "fetched_live_count": len(fetched_live),
+        "live_queries_used": live_queries_run,
+        "live_enabled": LIVE_SEARCH_ENABLED,
         "candidate_count": len(ranked),
+        "recent_candidate_count": recent_candidate_count,
         "configured_ir_sources": len(NEWS_SOURCE_FEEDS_IR),
         "configured_global_sources": len(NEWS_SOURCE_FEEDS_GLOBAL_ACTIVE),
         "ai_reasoning": ai_reasoning,
@@ -1877,7 +2254,12 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
     score_why = str(result.get("score_why", "")).strip()
     query_attempts = int(result.get("query_attempts", 0))
     fetched_count = int(result.get("fetched_count", 0))
+    fetched_rss_count = int(result.get("fetched_rss_count", 0))
+    fetched_live_count = int(result.get("fetched_live_count", 0))
+    live_queries_used = int(result.get("live_queries_used", 0))
+    live_enabled = bool(result.get("live_enabled", False))
     candidate_count = int(result.get("candidate_count", 0))
+    recent_candidate_count = int(result.get("recent_candidate_count", 0))
 
     lines = [
         "🧪 راستی‌آزمایی خبر",
@@ -1894,8 +2276,16 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
         ),
         f"🌐 تنوع منبع: {int(result.get('source_count', 0))} منبع",
         f"🗂 پایگاه بررسی: {global_count} منبع جهانی + {ir_count} منبع داخلی",
-        f"🔍 تلاش جست‌وجو: {query_attempts} کوئری | سند خام: {fetched_count} | کاندید مرتبط: {candidate_count}",
+        (
+            f"🔍 بازیابی سند: کوئری {query_attempts} | RSS {fetched_rss_count} | "
+            f"Live {fetched_live_count} | مجموع {fetched_count}"
+        ),
+        f"🕒 فیلتر زمانی: {FACTCHECK_RECENT_DAYS} روز اخیر | کاندید مرتبط: {candidate_count} | اخیر: {recent_candidate_count}",
     ]
+    if live_enabled:
+        lines.append(f"🌍 جست‌وجوی زنده وب: فعال (اجرا شده روی {live_queries_used} کوئری)")
+    else:
+        lines.append("🌍 جست‌وجوی زنده وب: غیرفعال (فقط ایندکس خبری/آرشیو)")
     if score_why:
         lines.append(f"📌 دلیل امتیاز: {score_why}")
     if score_reason == "no_evidence":
@@ -4032,7 +4422,8 @@ def help_text() -> str:
         "/fact_news متن | /factcheck متن | /verify_news متن | /newscheck متن\n"
         "/cred_short متن | /verify_short متن | /check_short متن\n"
         "/fact_pro متن | /factcheck_pro متن | /verify_claim متن\n"
-        "یا روی خبر ریپلای کن و یکی از دستورات بالا را بزن\n\n"
+        "یا روی خبر ریپلای کن و یکی از دستورات بالا را بزن\n"
+        "موتور بررسی: RSS + جست‌وجوی زنده وب + امتیازدهی سندمحور\n\n"
         "🎯 پیشنهاد محتوا:\n"
         "/recommend_me (خصوصی)\n"
         "/reco_on | /reco_off (گروه)\n"
@@ -4120,10 +4511,10 @@ def full_guide_text(is_group: bool = False) -> str:
         "• یا مستقیم: /summarize متن\n"
         "• خلاصه‌سازی کاملا با موتور داخلی خود ربات انجام می‌شود (بدون API).\n\n"
         "4) راستی‌آزمایی خبر\n"
-        "• حالت اخبار (پایگاه گسترده 200+ جهانی + 10 داخلی): /fact_news یا /factcheck\n"
+        "• حالت اخبار (پایگاه 200+ جهانی + 10 داخلی + جست‌وجوی زنده وب): /fact_news یا /factcheck\n"
         "• حالت خیلی خلاصه: /cred_short\n"
         "• حالت پیشرفته AI + تحلیل جزءبه‌جزء + منابع شماره‌دار: /fact_pro\n"
-        "• خروجی: درصد احتمال واقعی/فیک + منابع شاخص + جمع‌بندی\n\n"
+        "• خروجی: درصد احتمال واقعی/فیک + دلیل امتیاز + منابع شاخص + جمع‌بندی\n\n"
         "5) خرج و دنگ گروهی\n"
         "• ثبت خرج: /add 480 پیتزا\n"
         "• ساخت/تعویض لیست: /list_new عنوان | /lists | /list_use l2\n"
@@ -5804,7 +6195,7 @@ def factcheck_news(message):
         message,
         "🔎 در حال فکت‌سنجی اخبار...\n"
         "• بررسی گسترده در 200+ منبع جهانی + 10 منبع داخلی\n"
-        "• جست‌وجو در Google/Bing News RSS\n"
+        "• جست‌وجوی ترکیبی: RSS + وب زنده (DuckDuckGo/Bing News)\n"
         "• امتیازدهی موافق/مخالف و جمع‌بندی سندمحور",
     )
     result = run_news_factcheck(source_text, mode="news")
@@ -5875,6 +6266,7 @@ def factcheck_news_pro(message):
         message,
         "🧪 در حال راستی‌آزمایی پیشرفته...\n"
         "• تحلیل خبر با هوش مصنوعی + مدل‌سازی شواهد\n"
+        "• بازیابی ترکیبی: RSS + جست‌وجوی زنده وب\n"
         "• ترجمه ادعای فارسی برای چک در منابع بین‌المللی\n"
         "• استخراج فکت‌های جزئی و تناقض‌ها\n"
         "• ارائه سند، لینک و استدلال جزءبه‌جزء",
