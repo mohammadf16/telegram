@@ -127,6 +127,9 @@ DB_LOCK = threading.Lock()
 USER_RECO_SESSIONS: dict[str, dict[str, Any]] = {}
 REMINDER_DRAFTS: dict[str, dict[str, Any]] = {}
 REMINDER_DRAFT_COUNTER = 0
+AI_THREADS: dict[str, list[dict[str, str]]] = {}
+AI_MESSAGE_TO_THREAD: dict[str, str] = {}
+AI_LAST_THREAD_BY_CHAT: dict[str, str] = {}
 
 NEGATIVE_REPLY_KEYWORDS = ("کسشر شناسایی شد", "کسشر", "چرت بود", "مزخرف بود")
 POSITIVE_REPLY_KEYWORDS = ("شاهکار","جمله طلایی", "خفن بود", "عالی بود", "دمت گرم")
@@ -838,7 +841,43 @@ def get_global_config() -> dict[str, Any]:
         GLOBAL_SETTINGS.setdefault("gpt_daily_limit", 5)
         GLOBAL_SETTINGS.setdefault("gpt_day", "")
         GLOBAL_SETTINGS.setdefault("gpt_daily_count", 0)
+        GLOBAL_SETTINGS.setdefault("group_ai_daily_limit", 20)
+        GLOBAL_SETTINGS.setdefault("group_ai_day", "")
+        GLOBAL_SETTINGS.setdefault("group_ai_counts", {})
         return GLOBAL_SETTINGS
+
+
+def _group_ai_usage_state() -> tuple[str, int, dict[str, int]]:
+    today = today_key_tehran()
+    cfg = get_global_config()
+    should_save = False
+    with SETTINGS_LOCK:
+        if cfg.get("group_ai_day") != today:
+            cfg["group_ai_day"] = today
+            cfg["group_ai_counts"] = {}
+            should_save = True
+        limit = int(cfg.get("group_ai_daily_limit", 20))
+        counts = cfg.setdefault("group_ai_counts", {})
+    if should_save:
+        save_global_settings()
+    return today, limit, counts
+
+
+def get_group_ai_usage(chat_id: int) -> tuple[int, int]:
+    _, limit, counts = _group_ai_usage_state()
+    used = int(counts.get(str(chat_id), 0))
+    return used, max(1, limit)
+
+
+def consume_group_ai_usage(chat_id: int) -> tuple[int, int]:
+    _, limit, counts = _group_ai_usage_state()
+    key = str(chat_id)
+    used = 0
+    with SETTINGS_LOCK:
+        used = int(counts.get(key, 0)) + 1
+        counts[key] = used
+    save_global_settings()
+    return used, max(1, limit)
 
 
 def _new_reminder_draft_id() -> str:
@@ -1133,6 +1172,163 @@ def call_recommendation_model(prompt: str, max_output_tokens: int = 300) -> str:
     return ""
 
 
+AI_SYSTEM_PROMPT = (
+    "تو دستیار فارسی هستی. پاسخ‌ها کوتاه، عملی و دقیق باشند. "
+    "اگر کاربر ازت ادامه مکالمه خواست، در همان مسیر ادامه بده."
+)
+
+
+def _render_ai_prompt(messages: list[dict[str, str]]) -> str:
+    lines = [f"System: {AI_SYSTEM_PROMPT}"]
+    for msg in messages:
+        role = (msg.get("role") or "user").strip().lower()
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = "User" if role == "user" else "Assistant"
+        lines.append(f"{speaker}: {text}")
+    lines.append("Assistant:")
+    return "\n".join(lines)
+
+
+def call_ai_chat_model(messages: list[dict[str, str]], max_output_tokens: int = 420) -> str:
+    if not OPENAI_API_KEY:
+        return ""
+    prompt = _render_ai_prompt(messages)
+    return call_recommendation_model(prompt, max_output_tokens=max_output_tokens)
+
+
+def _strip_ai_prefix(text: str) -> str:
+    value = (text or "").strip()
+    prefixes = ("🤖 پاسخ هوش مصنوعی", "🤖")
+    for p in prefixes:
+        if value.startswith(p):
+            value = value[len(p) :].strip(" \n:-")
+    return value.strip()
+
+
+def _thread_key(chat_id: int, root_msg_id: int) -> str:
+    return f"{int(chat_id)}:{int(root_msg_id)}"
+
+
+def _trim_ai_thread(messages: list[dict[str, str]], max_items: int = 14) -> list[dict[str, str]]:
+    if len(messages) <= max_items:
+        return messages
+    return messages[-max_items:]
+
+
+def _is_reply_to_ai_message(message) -> bool:
+    reply = getattr(message, "reply_to_message", None)
+    if not reply:
+        return False
+    key = f"{int(message.chat.id)}:{int(reply.message_id)}"
+    if key in AI_MESSAGE_TO_THREAD:
+        return True
+    if not is_reply_to_this_bot(message):
+        return False
+    return _extract_message_text(reply).strip().startswith("🤖 پاسخ هوش مصنوعی")
+
+
+def _continue_thread_from_reply(message) -> tuple[str | None, list[dict[str, str]]]:
+    reply = getattr(message, "reply_to_message", None)
+    if not reply:
+        return None, []
+    key = f"{int(message.chat.id)}:{int(reply.message_id)}"
+    thread_id = AI_MESSAGE_TO_THREAD.get(key)
+    if thread_id and thread_id in AI_THREADS:
+        return thread_id, list(AI_THREADS.get(thread_id, []))
+
+    if not is_reply_to_this_bot(message):
+        return None, []
+    reply_text = _extract_message_text(reply)
+    clean_assistant = _strip_ai_prefix(reply_text)
+    if not clean_assistant:
+        return None, []
+    fallback_thread = _thread_key(message.chat.id, reply.message_id)
+    return fallback_thread, [{"role": "assistant", "text": clean_assistant}]
+
+
+def _send_ai_reply(message, text: str):
+    return bot.reply_to(message, f"🤖 پاسخ هوش مصنوعی\n\n{text}")
+
+
+def run_ai_chat(message, user_text: str, force_new: bool = False) -> bool:
+    prompt = (user_text or "").strip()
+    if not prompt:
+        return False
+
+    if is_group_chat(message):
+        used, limit = get_group_ai_usage(message.chat.id)
+        if used >= limit:
+            bot.reply_to(
+                message,
+                f"⛔️ سهمیه روزانه چت AI این گروه پر شده ({used}/{limit}). فردا دوباره فعال می‌شود.",
+            )
+            return True
+
+    thread_id: str
+    history: list[dict[str, str]]
+    if force_new:
+        thread_id = _thread_key(message.chat.id, message.message_id)
+        history = []
+    else:
+        reply_thread, reply_history = _continue_thread_from_reply(message)
+        if reply_thread:
+            thread_id = reply_thread
+            history = reply_history
+        else:
+            last_key = str(message.chat.id)
+            last_thread = AI_LAST_THREAD_BY_CHAT.get(last_key)
+            if last_thread and last_thread in AI_THREADS and not is_group_chat(message):
+                thread_id = last_thread
+                history = list(AI_THREADS.get(thread_id, []))
+            else:
+                thread_id = _thread_key(message.chat.id, message.message_id)
+                history = []
+
+    history.append({"role": "user", "text": prompt})
+    history = _trim_ai_thread(history)
+    answer = call_ai_chat_model(history)
+    if not answer:
+        bot.reply_to(message, "پاسخ AI موقتاً در دسترس نیست. چند لحظه بعد دوباره تلاش کن.")
+        return True
+
+    history.append({"role": "assistant", "text": answer})
+    history = _trim_ai_thread(history)
+    sent = _send_ai_reply(message, answer)
+
+    AI_THREADS[thread_id] = history
+    AI_LAST_THREAD_BY_CHAT[str(message.chat.id)] = thread_id
+    AI_MESSAGE_TO_THREAD[f"{int(message.chat.id)}:{int(sent.message_id)}"] = thread_id
+    if is_group_chat(message):
+        consume_group_ai_usage(message.chat.id)
+    return True
+
+
+def maybe_handle_ai_text_message(message) -> bool:
+    text = (message.text or "").strip()
+    if not text:
+        return False
+
+    if _is_reply_to_ai_message(message):
+        return run_ai_chat(message, text, force_new=False)
+
+    normalized = normalize_fa_text(text)
+    if normalized.startswith("هوش "):
+        payload = text[4:].strip()
+        if not payload:
+            bot.reply_to(message, "بعد از «هوش» سوالت را بنویس. مثال: هوش یک فیلم معمایی معرفی کن")
+            return True
+        return run_ai_chat(message, payload, force_new=True)
+    if normalize_text(text).startswith("ai "):
+        payload = text[3:].strip()
+        if not payload:
+            bot.reply_to(message, "بعد از ai سوالت را بنویس. مثال: ai یک کتاب کوتاه معرفی کن")
+            return True
+        return run_ai_chat(message, payload, force_new=True)
+    return False
+
+
 def fallback_recommendation(kind: str) -> str:
     if kind == "series":
         title, summary = daily_pick(DAILY_SERIES)
@@ -1266,6 +1462,7 @@ def _menu_keyboard(is_group: bool = False):
     kb.add(types.KeyboardButton("📈 بازار (ارز/سکه)"), types.KeyboardButton("🎭 امتیاز و شوخی"))
     kb.add(types.KeyboardButton("💰 خرج و دنگ"), types.KeyboardButton("📂 آرشیو"))
     kb.add(types.KeyboardButton("🎯 پیشنهاد شخصی"), types.KeyboardButton("🎬 پیشنهاد روزانه"))
+    kb.add(types.KeyboardButton("🤖 چت هوش مصنوعی"))
     kb.add(types.KeyboardButton("⚙️ راهنما"))
     if is_group:
         kb.add(types.KeyboardButton("⚙️ تنظیمات گروه"), types.KeyboardButton("🚀 ارسال فوری"))
@@ -1672,6 +1869,10 @@ def help_text() -> str:
         "/list_saved\n\n"
         "🎯 پیشنهاد شخصی با سوال‌وجواب:\n"
         "/recommend_me\n\n"
+        "🤖 چت هوش مصنوعی:\n"
+        "• شروع از صفر: /ask سوال\n"
+        "• ادامه گفتگو: روی جواب AI ریپلای کن و پیام بده\n"
+        "• وضعیت مصرف گروه: /ai_usage\n\n"
         "🎬 پیشنهاد روزانه:\n"
         "• از دکمه «🎬 پیشنهاد روزانه» پنل کامل را باز کن (بدون کامند)\n"
         "• نوع ارسال: فیلم/سریال/کتاب (هرکدام جدا روشن/خاموش)\n"
@@ -2862,7 +3063,35 @@ def recommend_me(message):
 
 @bot.message_handler(commands=["ask"])
 def ask_gpt(message):
-    bot.reply_to(message, "بخش چت GPT حذف شده. برای پیشنهاد شخصی از /recommend_me استفاده کن.")
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(
+            message,
+            "برای شروع جدید بنویس:\n/ask سوالت\n\n"
+            "برای ادامه گفتگو، روی آخرین جواب AI ریپلای کن و پیام بده.",
+        )
+        return
+    run_ai_chat(message, parts[1], force_new=True)
+
+
+@bot.message_handler(commands=["asknew"])
+def ask_gpt_new(message):
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "فرمت درست: /asknew سوال")
+        return
+    run_ai_chat(message, parts[1], force_new=True)
+
+
+@bot.message_handler(commands=["ai_usage"])
+def ai_usage(message):
+    if not is_group_chat(message):
+        bot.reply_to(message, "این دستور مخصوص گروه است.")
+        return
+    used, limit = get_group_ai_usage(message.chat.id)
+    bot.reply_to(message, f"📊 مصرف AI امروز گروه: {used}/{limit}")
 
 
 def is_owner(user_id: int) -> bool:
@@ -2891,11 +3120,13 @@ def owner_groups() -> list[int]:
 
 def owner_panel_text() -> str:
     groups = owner_groups()
+    gcfg = get_global_config()
     return (
         "🛡 سوپر پنل ادمین بات\n"
         f"• تعداد گروه‌ها: {len(groups)}\n"
         f"• فایل دیتابیس: {DB_PATH}\n"
         f"• مدل پیشنهاد: {OPENAI_MODEL}\n"
+        f"• لیمیت روزانه AI هر گروه: {int(gcfg.get('group_ai_daily_limit', 20))}\n"
         "یک گروه را از دکمه‌ها انتخاب کن."
     )
 
@@ -2915,6 +3146,7 @@ def owner_panel_markup():
 def owner_group_text(chat_id: int) -> str:
     cfg = get_group_config(chat_id)
     reco = get_reco_config(chat_id)
+    ai_used, ai_limit = get_group_ai_usage(chat_id)
     reco_types = []
     if reco.get("send_movie", False):
         reco_types.append("فیلم")
@@ -2930,7 +3162,8 @@ def owner_group_text(chat_id: int) -> str:
         f"• کریپتو: {'روشن' if cfg.get('include_crypto', False) else 'خاموش'}\n"
         f"• پیشنهاد روزانه: {'روشن' if reco.get('enabled', False) else 'خاموش'}\n"
         f"• زمان reco: {int(reco.get('hour', 21)):02d}:{int(reco.get('minute', 0)):02d}\n"
-        f"• نوع‌های reco: {', '.join(reco_types) if reco_types else 'هیچکدام'}"
+        f"• نوع‌های reco: {', '.join(reco_types) if reco_types else 'هیچکدام'}\n"
+        f"• مصرف AI امروز: {ai_used}/{ai_limit}"
     )
 
 
@@ -3011,12 +3244,37 @@ def owner_panel(message):
 
 @bot.message_handler(commands=["set_gpt"])
 def set_gpt(message):
-    bot.reply_to(message, "بخش چت GPT حذف شده. GPT فقط برای بخش پیشنهادها استفاده می‌شود.")
+    bot.reply_to(
+        message,
+        "چت AI فعاله:\n"
+        "• شروع جدید: /ask سوال\n"
+        "• ادامه: ریپلای روی جواب AI\n"
+        "• مصرف گروه: /ai_usage",
+    )
 
 
 @bot.message_handler(commands=["set_gpt_limit"])
 def set_gpt_limit(message):
-    bot.reply_to(message, "این دستور غیرفعال شده.")
+    if not is_owner(message.from_user.id):
+        bot.reply_to(message, "فقط صاحب بات دسترسی دارد.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "فرمت: /set_gpt_limit 20")
+        return
+    try:
+        limit = int(parts[1].strip())
+    except Exception:
+        bot.reply_to(message, "عدد معتبر وارد کن.")
+        return
+    if limit < 1 or limit > 200:
+        bot.reply_to(message, "بازه مجاز: 1 تا 200")
+        return
+    cfg = get_global_config()
+    with SETTINGS_LOCK:
+        cfg["group_ai_daily_limit"] = limit
+    save_global_settings()
+    bot.reply_to(message, f"✅ لیمیت روزانه چت AI برای هر گروه روی {limit} تنظیم شد.")
 
 
 @bot.callback_query_handler(func=lambda call: (call.data or "").startswith("ow:"))
@@ -3333,6 +3591,7 @@ def quick_keyword_reply(message):
         "📂 آرشیو",
         "🎯 پیشنهاد شخصی",
         "🎬 پیشنهاد روزانه",
+        "🤖 چت هوش مصنوعی",
         "⚙️ راهنما",
         "⚙️ تنظیمات گروه",
         "🚀 ارسال فوری",
@@ -3347,6 +3606,9 @@ def quick_keyword_reply(message):
         return
 
     if maybe_handle_reply_scoring(message):
+        return
+
+    if maybe_handle_ai_text_message(message):
         return
 
     # In groups, check all normal messages but only if they include price wording.
@@ -3379,6 +3641,7 @@ def quick_keyword_reply(message):
         "📂 آرشیو",
         "🎯 پیشنهاد شخصی",
         "🎬 پیشنهاد روزانه",
+        "🤖 چت هوش مصنوعی",
         "⚙️ راهنما",
         "⚙️ تنظیمات گروه",
         "🚀 ارسال فوری",
@@ -3462,6 +3725,27 @@ def menu_buttons(message):
             )
         else:
             bot.send_message(message.chat.id, build_daily_recommendation_text(mode="movie"))
+        return
+
+    if txt == "🤖 چت هوش مصنوعی":
+        if is_group_chat(message):
+            used, limit = get_group_ai_usage(message.chat.id)
+            bot.reply_to(
+                message,
+                "🤖 چت AI گروه\n"
+                "• شروع جدید: /ask سوال\n"
+                "• ادامه: روی جواب AI ریپلای کن\n"
+                "• شروع سریع: اول پیام بنویس «هوش »\n"
+                f"• مصرف امروز گروه: {used}/{limit}",
+            )
+        else:
+            bot.reply_to(
+                message,
+                "🤖 چت AI خصوصی\n"
+                "• شروع جدید: /ask سوال\n"
+                "• ادامه: به پاسخ قبلی ریپلای کن\n"
+                "• شروع سریع: اول پیام بنویس «هوش »",
+            )
         return
 
     if txt == "📈 بیشترین تغییر":
