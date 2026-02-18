@@ -822,7 +822,94 @@ def get_expense_state(chat_id: int) -> dict[str, Any]:
         state = EXPENSES.setdefault(key, {})
         state.setdefault("entries", [])
         state.setdefault("participants", {})
+        lists = state.setdefault("lists", {})
+        active = str(state.get("active_list_id", "")).strip()
+
+        # One-time migration from old single-list structure.
+        if not lists:
+            default_id = "l1"
+            lists[default_id] = {
+                "id": default_id,
+                "title": "لیست اصلی",
+                "created_by": "0",
+                "created_at": int(time.time()),
+                "participants": dict(state.get("participants", {}) or {}),
+                "entries": list(state.get("entries", []) or []),
+            }
+            state["active_list_id"] = default_id
+            active = default_id
+
+        # Ensure list shape.
+        for lid, lst in lists.items():
+            if not isinstance(lst, dict):
+                lists[lid] = {"id": lid, "title": f"لیست {lid}", "created_by": "0", "created_at": int(time.time())}
+                lst = lists[lid]
+            lst.setdefault("id", lid)
+            lst.setdefault("title", f"لیست {lid}")
+            lst.setdefault("created_by", "0")
+            lst.setdefault("created_at", int(time.time()))
+            lst.setdefault("participants", {})
+            lst.setdefault("entries", [])
+
+        if not active or active not in lists:
+            state["active_list_id"] = next(iter(lists.keys()))
         return state
+
+
+def _expense_user_name(user) -> str:
+    return user.first_name or user.username or str(user.id)
+
+
+def _new_empty_expense_state() -> dict[str, Any]:
+    return {
+        "entries": [],
+        "participants": {},
+        "lists": {
+            "l1": {
+                "id": "l1",
+                "title": "لیست اصلی",
+                "created_by": "0",
+                "created_at": int(time.time()),
+                "participants": {},
+                "entries": [],
+            }
+        },
+        "active_list_id": "l1",
+    }
+
+
+def _new_expense_list_id(state: dict[str, Any]) -> str:
+    lists = state.get("lists", {})
+    max_num = 0
+    for lid in lists.keys():
+        if isinstance(lid, str) and lid.startswith("l") and lid[1:].isdigit():
+            max_num = max(max_num, int(lid[1:]))
+    return f"l{max_num + 1}"
+
+
+def _get_expense_list(state: dict[str, Any], list_id: str | None = None) -> dict[str, Any]:
+    lists = state.get("lists", {})
+    lid = (list_id or state.get("active_list_id") or "").strip()
+    if lid in lists:
+        return lists[lid]
+    if lists:
+        first_key = next(iter(lists.keys()))
+        state["active_list_id"] = first_key
+        return lists[first_key]
+    # Should not happen after get_expense_state, but keep safe fallback.
+    new_id = "l1"
+    state["lists"] = {
+        new_id: {
+            "id": new_id,
+            "title": "لیست اصلی",
+            "created_by": "0",
+            "created_at": int(time.time()),
+            "participants": {},
+            "entries": [],
+        }
+    }
+    state["active_list_id"] = new_id
+    return state["lists"][new_id]
 
 
 def get_archive_map(chat_id: int) -> dict[str, Any]:
@@ -1595,33 +1682,46 @@ def _menu_keyboard(is_group: bool = False):
 
 def expense_panel_text(chat_id: int) -> str:
     state = get_expense_state(chat_id)
-    entries = state.get("entries", [])
+    current = _get_expense_list(state)
+    entries = current.get("entries", [])
     total = sum(float(x.get("amount", 0)) for x in entries)
-    participants = state.get("participants", {})
+    participants = current.get("participants", {})
+    list_id = current.get("id", "-")
+    title = current.get("title", "لیست")
+    lists_count = len(state.get("lists", {}))
     return (
-        "💰 پنل دنگ و خرج گروه\n"
+        "💰 پنل دنگ و خرج گروه (لیست‌محور)\n"
+        f"• لیست فعال: {title} ({list_id})\n"
+        f"• تعداد لیست‌ها: {lists_count}\n"
         f"• تعداد خرج‌ها: {len(entries)}\n"
         f"• مجموع خرج: {total:g}\n"
-        f"• اعضای تسویه: {len(participants)}\n\n"
-        "ثبت خرج همچنان با دستور سریع است:\n"
-        "/add 480 پیتزا"
+        f"• اعضای دنگ این لیست: {len(participants)}\n\n"
+        "ثبت خرج در لیست فعال:\n"
+        "/add 480 پیتزا\n"
+        "ساخت لیست جدید:\n"
+        "/list_new خرید آخر هفته"
     )
 
 
 def expense_panel_markup(chat_id: int):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton("➕ عضویت در تسویه", callback_data=f"ex:join:{chat_id}"),
-        types.InlineKeyboardButton("🧾 نمایش خرج‌ها", callback_data=f"ex:show:{chat_id}"),
+        types.InlineKeyboardButton("🆕 لیست جدید", callback_data=f"ex:new:{chat_id}"),
+        types.InlineKeyboardButton("🔁 لیست بعدی", callback_data=f"ex:next:{chat_id}"),
     )
     kb.add(
-        types.InlineKeyboardButton("💳 محاسبه دنگ", callback_data=f"ex:split:{chat_id}"),
-        types.InlineKeyboardButton("🗑 پاکسازی خرج‌ها", callback_data=f"ex:clear:{chat_id}"),
+        types.InlineKeyboardButton("➕ عضویت در دنگ", callback_data=f"ex:join:{chat_id}"),
+        types.InlineKeyboardButton("👥 اعضای لیست", callback_data=f"ex:members:{chat_id}"),
     )
     kb.add(
+        types.InlineKeyboardButton("🧾 خرج‌های لیست", callback_data=f"ex:show:{chat_id}"),
+        types.InlineKeyboardButton("💳 تسویه لیست", callback_data=f"ex:split:{chat_id}"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🗑 پاکسازی لیست فعال", callback_data=f"ex:clear:{chat_id}"),
         types.InlineKeyboardButton("🔄 تازه سازی", callback_data=f"ex:refresh:{chat_id}"),
-        types.InlineKeyboardButton("❌ بستن پنل", callback_data=f"ex:close:{chat_id}"),
     )
+    kb.add(types.InlineKeyboardButton("❌ بستن پنل", callback_data=f"ex:close:{chat_id}"))
     return kb
 
 
@@ -2115,7 +2215,13 @@ def help_text() -> str:
         "• /scoreboard | /my_score\n\n"
         "💰 خرج و دنگ:\n"
         "/add 480 پیتزا\n"
+        "/list_new خرید هفته\n"
+        "/lists\n"
+        "/list_use l2\n"
         "/join_split\n"
+        "/list_add_member (روی پیام کاربر ریپلای)\n"
+        "/list_remove_member (روی پیام کاربر ریپلای)\n"
+        "/list_members\n"
         "/expenses\n"
         "/split\n"
         "/clear_expenses\n\n"
@@ -2497,7 +2603,7 @@ def group_settings_callbacks(call):
             save_scores()
         elif data_action == "reset_expenses":
             with SETTINGS_LOCK:
-                EXPENSES[str(chat_id)] = {"entries": [], "participants": {}}
+                EXPENSES[str(chat_id)] = _new_empty_expense_state()
             save_expenses()
         elif data_action == "reset_archive":
             with SETTINGS_LOCK:
@@ -2511,7 +2617,7 @@ def group_settings_callbacks(call):
     elif len(payload) >= 2 and payload[1] == "reset_expenses":
         page = "data"
         with SETTINGS_LOCK:
-            EXPENSES[str(chat_id)] = {"entries": [], "participants": {}}
+            EXPENSES[str(chat_id)] = _new_empty_expense_state()
         save_expenses()
     elif len(payload) >= 2 and payload[1] == "reset_archive":
         page = "data"
@@ -2912,9 +3018,10 @@ def add_expense(message):
         return
     desc = parts[2].strip() if len(parts) > 2 else "بدون توضیح"
     state = get_expense_state(message.chat.id)
+    current = _get_expense_list(state)
     uid = str(message.from_user.id)
-    name = message.from_user.first_name or message.from_user.username or uid
-    state["entries"].append(
+    name = _expense_user_name(message.from_user)
+    current["entries"].append(
         {
             "by_id": uid,
             "by_name": name,
@@ -2923,9 +3030,74 @@ def add_expense(message):
             "ts": int(time.time()),
         }
     )
-    state["participants"].setdefault(uid, name)
+    current["participants"].setdefault(uid, name)
     save_expenses()
-    bot.reply_to(message, f"ثبت شد: {amount:g} - {desc}")
+    bot.reply_to(
+        message,
+        f"ثبت شد در {current.get('title', current.get('id', 'لیست'))}: {amount:g} - {desc}",
+    )
+
+
+@bot.message_handler(commands=["list_new"])
+def expense_list_new(message):
+    if not is_group_chat(message):
+        bot.reply_to(message, "این دستور فقط داخل گروه است.")
+        return
+    title = (message.text or "").split(maxsplit=1)[1].strip() if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    if not title:
+        title = f"لیست {now_tehran().strftime('%m/%d %H:%M')}"
+    state = get_expense_state(message.chat.id)
+    new_id = _new_expense_list_id(state)
+    creator_id = str(message.from_user.id)
+    creator_name = _expense_user_name(message.from_user)
+    state["lists"][new_id] = {
+        "id": new_id,
+        "title": title[:60],
+        "created_by": creator_id,
+        "created_at": int(time.time()),
+        "participants": {creator_id: creator_name},
+        "entries": [],
+    }
+    state["active_list_id"] = new_id
+    save_expenses()
+    bot.reply_to(message, f"✅ لیست جدید ساخته شد: {title} ({new_id})\nاین لیست الان فعال است.")
+
+
+@bot.message_handler(commands=["list_use"])
+def expense_list_use(message):
+    if not is_group_chat(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "فرمت: /list_use l2")
+        return
+    list_id = parts[1].strip().lower()
+    state = get_expense_state(message.chat.id)
+    if list_id not in state.get("lists", {}):
+        bot.reply_to(message, "این لیست پیدا نشد. /lists را بزن.")
+        return
+    state["active_list_id"] = list_id
+    save_expenses()
+    lst = state["lists"][list_id]
+    bot.reply_to(message, f"✅ لیست فعال شد: {lst.get('title', list_id)} ({list_id})")
+
+
+@bot.message_handler(commands=["lists"])
+def expense_lists(message):
+    if not is_group_chat(message):
+        return
+    state = get_expense_state(message.chat.id)
+    lists = state.get("lists", {})
+    active = state.get("active_list_id", "")
+    lines = ["🧾 لیست‌های خرج گروه:"]
+    for lid, lst in lists.items():
+        mark = "⭐" if lid == active else "•"
+        lines.append(
+            f"{mark} {lid} | {lst.get('title', 'لیست')} | "
+            f"اعضا: {len(lst.get('participants', {}))} | خرج: {len(lst.get('entries', []))}"
+        )
+    lines.append("\nبرای انتخاب: /list_use l2")
+    bot.reply_to(message, "\n".join(lines))
 
 
 @bot.message_handler(commands=["join_split"])
@@ -2933,10 +3105,62 @@ def join_split(message):
     if not is_group_chat(message):
         return
     state = get_expense_state(message.chat.id)
+    current = _get_expense_list(state)
     uid = str(message.from_user.id)
-    state["participants"][uid] = message.from_user.first_name or message.from_user.username or uid
+    current["participants"][uid] = _expense_user_name(message.from_user)
     save_expenses()
-    bot.reply_to(message, "شما به لیست تسویه اضافه شدید.")
+    bot.reply_to(message, f"شما به لیست {current.get('title', current.get('id', 'لیست'))} اضافه شدید.")
+
+
+@bot.message_handler(commands=["list_add_member"])
+def list_add_member(message):
+    if not is_group_chat(message):
+        return
+    if not getattr(message, "reply_to_message", None) or not getattr(message.reply_to_message, "from_user", None):
+        bot.reply_to(message, "روی پیام کاربر ریپلای کن و /list_add_member بزن.")
+        return
+    target = message.reply_to_message.from_user
+    state = get_expense_state(message.chat.id)
+    current = _get_expense_list(state)
+    uid = str(target.id)
+    current["participants"][uid] = _expense_user_name(target)
+    save_expenses()
+    bot.reply_to(message, f"✅ {current['participants'][uid]} به لیست فعال اضافه شد.")
+
+
+@bot.message_handler(commands=["list_remove_member"])
+def list_remove_member(message):
+    if not is_group_chat(message):
+        return
+    if not getattr(message, "reply_to_message", None) or not getattr(message.reply_to_message, "from_user", None):
+        bot.reply_to(message, "روی پیام کاربر ریپلای کن و /list_remove_member بزن.")
+        return
+    target = message.reply_to_message.from_user
+    state = get_expense_state(message.chat.id)
+    current = _get_expense_list(state)
+    uid = str(target.id)
+    if uid in current.get("participants", {}):
+        del current["participants"][uid]
+        save_expenses()
+        bot.reply_to(message, "✅ از لیست فعال حذف شد.")
+    else:
+        bot.reply_to(message, "این کاربر داخل اعضای لیست فعال نیست.")
+
+
+@bot.message_handler(commands=["list_members"])
+def list_members(message):
+    if not is_group_chat(message):
+        return
+    state = get_expense_state(message.chat.id)
+    current = _get_expense_list(state)
+    members = current.get("participants", {})
+    if not members:
+        bot.reply_to(message, "هنوز عضوی برای دنگ در لیست فعال ثبت نشده.")
+        return
+    lines = [f"👥 اعضای لیست {current.get('title', current.get('id', 'لیست'))}:"]
+    for name in members.values():
+        lines.append(f"• {name}")
+    bot.reply_to(message, "\n".join(lines))
 
 
 @bot.message_handler(commands=["expenses"])
@@ -2944,9 +3168,10 @@ def expenses_summary(message):
     if not is_group_chat(message):
         return
     state = get_expense_state(message.chat.id)
-    entries = state.get("entries", [])
+    current = _get_expense_list(state)
+    entries = current.get("entries", [])
     if not entries:
-        bot.reply_to(message, "هنوز خرجی ثبت نشده.")
+        bot.reply_to(message, "در لیست فعال هنوز خرجی ثبت نشده.")
         return
     total = sum(float(x.get("amount", 0)) for x in entries)
     by_user: dict[str, float] = {}
@@ -2955,14 +3180,14 @@ def expenses_summary(message):
         uid = str(item.get("by_id"))
         by_user[uid] = by_user.get(uid, 0.0) + float(item.get("amount", 0))
         by_name[uid] = str(item.get("by_name", uid))
-    lines = [f"💰 مجموع خرج: {total:g}", "", "پرداخت هر نفر:"]
+    lines = [f"🧾 لیست: {current.get('title', current.get('id', 'لیست'))}", f"💰 مجموع خرج: {total:g}", "", "پرداخت هر نفر:"]
     for uid, value in sorted(by_user.items(), key=lambda x: x[1], reverse=True):
         lines.append(f"• {by_name.get(uid, uid)}: {value:g}")
     bot.reply_to(message, "\n".join(lines))
 
 
-def _compute_split_settlements(state: dict[str, Any]) -> list[str]:
-    entries = state.get("entries", [])
+def _compute_split_settlements(expense_list: dict[str, Any]) -> list[str]:
+    entries = expense_list.get("entries", [])
     if not entries:
         return []
     paid: dict[str, float] = {}
@@ -2971,7 +3196,7 @@ def _compute_split_settlements(state: dict[str, Any]) -> list[str]:
         uid = str(item.get("by_id"))
         paid[uid] = paid.get(uid, 0.0) + float(item.get("amount", 0))
         names[uid] = str(item.get("by_name", uid))
-    participants: dict[str, str] = state.get("participants", {}) or {}
+    participants: dict[str, str] = expense_list.get("participants", {}) or {}
     if not participants:
         participants = {uid: names.get(uid, uid) for uid in paid.keys()}
     for uid, nm in participants.items():
@@ -2991,7 +3216,10 @@ def _compute_split_settlements(state: dict[str, Any]) -> list[str]:
         elif bal > 0.01:
             creditors.append((uid, bal))
 
-    settlements: list[str] = [f"💳 سهم هر نفر: {share:g}"]
+    settlements: list[str] = [
+        f"🧾 لیست: {expense_list.get('title', expense_list.get('id', 'لیست'))}",
+        f"💳 سهم هر نفر: {share:g}",
+    ]
     i, j = 0, 0
     while i < len(debtors) and j < len(creditors):
         d_uid, d_amt = debtors[i]
@@ -3014,7 +3242,8 @@ def split_expense(message):
     if not is_group_chat(message):
         return
     state = get_expense_state(message.chat.id)
-    settlements = _compute_split_settlements(state)
+    current = _get_expense_list(state)
+    settlements = _compute_split_settlements(current)
     if not settlements:
         bot.reply_to(message, "برای تسویه ابتدا خرج ثبت کنید: /add مبلغ توضیح")
         return
@@ -3025,9 +3254,12 @@ def split_expense(message):
 def clear_expenses(message):
     if not require_group_admin(message):
         return
-    EXPENSES[str(message.chat.id)] = {"entries": [], "participants": {}}
+    state = get_expense_state(message.chat.id)
+    current = _get_expense_list(state)
+    current["entries"] = []
+    current["participants"] = {}
     save_expenses()
-    bot.reply_to(message, "لیست خرج و تسویه پاک شد.")
+    bot.reply_to(message, "لیست فعال پاک شد.")
 
 
 @bot.message_handler(commands=["expense_panel"])
@@ -3055,38 +3287,74 @@ def expense_panel_callbacks(call):
         bot.answer_callback_query(call.id, "پنل مربوط به گروه دیگری است.", show_alert=True)
         return
 
-    if action == "join":
-        state = get_expense_state(chat_id)
-        uid = str(call.from_user.id)
-        state["participants"][uid] = call.from_user.first_name or call.from_user.username or uid
+    state = get_expense_state(chat_id)
+    current = _get_expense_list(state)
+    answered = False
+
+    if action == "new":
+        new_id = _new_expense_list_id(state)
+        creator_id = str(call.from_user.id)
+        creator_name = _expense_user_name(call.from_user)
+        state["lists"][new_id] = {
+            "id": new_id,
+            "title": f"لیست {now_tehran().strftime('%m/%d %H:%M')}",
+            "created_by": creator_id,
+            "created_at": int(time.time()),
+            "participants": {creator_id: creator_name},
+            "entries": [],
+        }
+        state["active_list_id"] = new_id
         save_expenses()
+    elif action == "next":
+        lids = list(state.get("lists", {}).keys())
+        if lids:
+            active = str(state.get("active_list_id", lids[0]))
+            idx = lids.index(active) if active in lids else 0
+            state["active_list_id"] = lids[(idx + 1) % len(lids)]
+            save_expenses()
+    elif action == "join":
+        uid = str(call.from_user.id)
+        current["participants"][uid] = _expense_user_name(call.from_user)
+        save_expenses()
+    elif action == "members":
+        participants = current.get("participants", {})
+        if participants:
+            lines = [f"👥 اعضای {current.get('title', current.get('id', 'لیست'))}:"]
+            lines.extend([f"• {name}" for name in participants.values()])
+            try:
+                bot.send_message(chat_id, "\n".join(lines))
+            except Exception:
+                pass
+        else:
+            bot.answer_callback_query(call.id, "عضوی ثبت نشده.")
+            answered = True
     elif action == "show":
-        state = get_expense_state(chat_id)
-        entries = state.get("entries", [])
+        entries = current.get("entries", [])
         if entries:
             total = sum(float(x.get("amount", 0)) for x in entries)
-            lines = [f"💰 مجموع خرج: {total:g}"]
+            lines = [f"🧾 {current.get('title', current.get('id', 'لیست'))}", f"💰 مجموع خرج: {total:g}"]
             for item in entries[-10:]:
                 lines.append(f"• {item.get('by_name', 'کاربر')}: {float(item.get('amount', 0)):g} - {item.get('desc', '')}")
             try:
-                bot.answer_callback_query(call.id, "نمایش ۱۰ مورد آخر")
                 bot.send_message(chat_id, "\n".join(lines))
             except Exception:
                 pass
         else:
             bot.answer_callback_query(call.id, "هنوز خرجی ثبت نشده.")
+            answered = True
     elif action == "split":
-        state = get_expense_state(chat_id)
-        settlements = _compute_split_settlements(state)
+        settlements = _compute_split_settlements(current)
         if settlements:
             bot.send_message(chat_id, "\n".join(["🧾 نتیجه تسویه"] + settlements))
         else:
             bot.answer_callback_query(call.id, "خرجی برای تسویه نیست.")
+            answered = True
     elif action == "clear":
         if not has_group_management_access(chat_id, call.from_user.id):
             bot.answer_callback_query(call.id, "فقط ادمین گروه یا ادمین بات", show_alert=True)
             return
-        EXPENSES[str(chat_id)] = {"entries": [], "participants": {}}
+        current["entries"] = []
+        current["participants"] = {}
         save_expenses()
     elif action == "close":
         try:
@@ -3107,7 +3375,8 @@ def expense_panel_callbacks(call):
         )
     except Exception:
         pass
-    bot.answer_callback_query(call.id)
+    if not answered:
+        bot.answer_callback_query(call.id)
 
 
 @bot.callback_query_handler(func=lambda call: (call.data or "").startswith("rm:"))
@@ -3819,7 +4088,7 @@ def owner_panel_callbacks(call):
             SCORES[str(chat_id)] = {}
             save_scores()
         elif key == "expenses":
-            EXPENSES[str(chat_id)] = {"entries": [], "participants": {}}
+            EXPENSES[str(chat_id)] = _new_empty_expense_state()
             save_expenses()
         elif key == "archive":
             ARCHIVE[str(chat_id)] = {}
