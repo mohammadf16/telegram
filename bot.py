@@ -1344,6 +1344,69 @@ def _fetch_query_news_items(query: str) -> list[dict[str, Any]]:
     return merged
 
 
+def _simplify_search_query(text: str, max_terms: int = 9) -> str:
+    raw = _clean_html_text(text or "")
+    if not raw:
+        return ""
+    raw = re.sub(r"https?://\S+", " ", raw)
+    raw = re.sub(r"[@#]\S+", " ", raw)
+    raw = re.sub(r"[^\w\u0600-\u06FF\s\-\.:]", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        return ""
+    tokens = _extract_fact_keywords(raw, limit=max_terms * 2)
+    if not tokens:
+        return " ".join(raw.split()[:max_terms]).strip()
+    out: list[str] = []
+    for tok in tokens:
+        if tok and tok not in out:
+            out.append(tok)
+        if len(out) >= max_terms:
+            break
+    return " ".join(out).strip()
+
+
+def _build_fact_search_queries(
+    claim: str,
+    translated: str,
+    base_queries: list[str],
+    max_queries: int,
+) -> list[str]:
+    candidates: list[str] = []
+    for q in base_queries:
+        qq = " ".join((q or "").split()).strip()
+        if qq:
+            candidates.append(qq[:220])
+        sq = _simplify_search_query(qq, max_terms=9)
+        if sq:
+            candidates.append(sq[:170])
+    claim_short = _simplify_search_query(claim, max_terms=10)
+    if claim_short:
+        candidates.append(claim_short[:170])
+    if translated:
+        translated_short = _simplify_search_query(translated, max_terms=10)
+        if translated_short:
+            candidates.append(translated_short[:170])
+    # Very short fallback for tough matches.
+    heavy_terms = _extract_fact_keywords(" ".join([claim, translated]), limit=14)
+    if heavy_terms:
+        candidates.append(" ".join(heavy_terms[:6])[:120])
+        candidates.append(" ".join(heavy_terms[:4])[:90])
+
+    out: list[str] = []
+    for q in candidates:
+        qq = " ".join((q or "").split()).strip()
+        if not qq:
+            continue
+        if len(qq) < 6:
+            continue
+        if qq not in out:
+            out.append(qq)
+        if len(out) >= max_queries:
+            break
+    return out
+
+
 def _domain_from_url(url: str) -> str:
     value = (url or "").strip()
     if not value:
@@ -1546,6 +1609,48 @@ def _parse_bing_html_results(html_text: str, max_items: int = 12) -> list[dict[s
     return out
 
 
+def _parse_google_news_html_results(html_text: str, max_items: int = 12) -> list[dict[str, Any]]:
+    if not html_text.strip():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        soup = BeautifulSoup(html_text, "lxml")
+        nodes = soup.select("a[href]")
+        for node in nodes:
+            href = (node.get("href") or "").strip()
+            if not href:
+                continue
+            # Typical Google redirect path.
+            if href.startswith("/url?"):
+                qs = parse_qs(urlsplit(href).query or "")
+                href = unquote((qs.get("q") or [""])[0]).strip()
+            if not href.startswith("http"):
+                continue
+            title = _clean_html_text(node.get_text(" ", strip=True))
+            if len(title) < 12:
+                continue
+            source_name = _domain_from_url(href) or "Web"
+            out.append(
+                {
+                    "source": source_name,
+                    "source_region": "mixed",
+                    "source_lang": "unknown",
+                    "source_tier": _infer_source_tier(source_name, fallback="medium"),
+                    "title": title[:600],
+                    "summary": "",
+                    "link": _canonical_news_link(href)[:1200],
+                    "published_ts": None,
+                    "normalized_title": normalize_fa_text(title)[:700],
+                    "fetched_at": int(time.time()),
+                }
+            )
+            if len(out) >= max_items:
+                break
+    except Exception:
+        return out
+    return out
+
+
 def _news_item_timestamp(item: dict[str, Any]) -> int:
     try:
         return int(item.get("published_ts") or item.get("fetched_at") or 0)
@@ -1606,6 +1711,7 @@ def _fetch_live_search_items(query: str, max_items: int = LIVE_SEARCH_MAX_RESULT
         return []
     ddg_url = f"https://duckduckgo.com/html/?q={q}%20news"
     bing_url = f"https://www.bing.com/news/search?q={q}"
+    google_news_url = f"https://www.google.com/search?tbm=nws&q={q}"
     merged: list[dict[str, Any]] = []
     ddg_html = _fetch_live_search_page(ddg_url)
     if ddg_html:
@@ -1613,6 +1719,9 @@ def _fetch_live_search_items(query: str, max_items: int = LIVE_SEARCH_MAX_RESULT
     bing_html = _fetch_live_search_page(bing_url)
     if bing_html:
         merged.extend(_parse_bing_html_results(bing_html, max_items=max_items))
+    google_html = _fetch_live_search_page(google_news_url)
+    if google_html:
+        merged.extend(_parse_google_news_html_results(google_html, max_items=max_items))
     merged = _merge_live_items(merged)
     if LIVE_FETCH_MAX_ARTICLES <= 0:
         return merged[:max_items]
@@ -1943,17 +2052,17 @@ def _score_factcheck(
 ) -> dict[str, Any]:
     if not items:
         return {
-            "verdict": "نامطمئن",
-            "truth_prob": 0.5,
-            "fake_prob": 0.5,
-            "confidence": 0.15,
+            "verdict": "فاقد سند کافی",
+            "truth_prob": 0.0,
+            "fake_prob": 0.0,
+            "confidence": 0.0,
             "evidence": [],
             "support_count": 0,
             "refute_count": 0,
             "related_count": 0,
             "source_count": 0,
             "score_reason": "no_evidence",
-            "score_why": "هیچ سند خبری مرتبطی با آستانه شباهت لازم پیدا نشد؛ امتیاز به صورت خنثی 50/50 تنظیم شد.",
+            "score_why": "هیچ سند خبری مرتبطی با آستانه شباهت لازم پیدا نشد؛ امتیازدهی احتمال انجام نشد.",
         }
 
     now_ts = int(time.time())
@@ -2035,7 +2144,11 @@ def _score_factcheck(
     score_why = "امتیاز بر اساس شواهد موافق/مخالف، اعتبار منبع، تازگی خبر و شباهت محتوایی محاسبه شد."
     if len([s for s in seen_sources if s]) == 0 or (support_count + refute_count + related_count) == 0:
         score_reason = "no_evidence"
-        score_why = "سند مستقیم کافی پیدا نشد؛ نتیجه عددی خنثی/کم‌اطمینان است."
+        score_why = "سند مستقیم کافی پیدا نشد؛ امتیازدهی احتمال انجام نشد."
+        truth_prob = 0.0
+        fake_prob = 0.0
+        confidence = min(confidence, 0.10)
+        verdict = "فاقد سند کافی"
     elif support_count > 0 and refute_count > 0:
         score_reason = "conflicting_evidence"
         score_why = "شواهد معتبر هم‌زمان موافق و مخالف وجود دارد؛ نتیجه نهایی با اطمینان پایین‌تر گزارش شد."
@@ -2125,6 +2238,14 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
         if qq and qq not in uniq_queries:
             uniq_queries.append(qq)
     uniq_queries = uniq_queries[:FACTCHECK_QUERY_MAX]
+    retrieval_queries = _build_fact_search_queries(
+        claim=claim,
+        translated=translated,
+        base_queries=uniq_queries,
+        max_queries=max(FACTCHECK_QUERY_MAX + 3, 6),
+    )
+    if not retrieval_queries:
+        retrieval_queries = uniq_queries[:]
 
     mode_evidence_limit = 4 if check_mode == "brief" else (10 if check_mode == "news" else FACTCHECK_MAX_EVIDENCE)
     refresh_info = refresh_news_index(force=False)
@@ -2136,7 +2257,7 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
         8 if check_mode == "brief" else (12 if check_mode == "news" else max(12, LIVE_SEARCH_MAX_RESULTS)),
     )
     live_queries_run = 0
-    for idx, query in enumerate(uniq_queries):
+    for idx, query in enumerate(retrieval_queries):
         rss_items = _fetch_query_news_items(query)
         if rss_items:
             fetched_rss.extend(rss_items)
@@ -2145,6 +2266,23 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
             live_items = _fetch_live_search_items(query, max_items=live_items_per_query)
             if live_items:
                 fetched_live.extend(live_items)
+
+    # Second-pass fallback with shorter keyword queries when nothing was fetched.
+    if not fetched_rss and not fetched_live:
+        fallback_terms = _extract_fact_keywords(" ".join([claim, translated]), limit=10)
+        fallback_queries: list[str] = []
+        if len(fallback_terms) >= 3:
+            fallback_queries.append(" ".join(fallback_terms[:3]))
+        if len(fallback_terms) >= 5:
+            fallback_queries.append(" ".join(fallback_terms[:5]))
+        for q in fallback_queries[:2]:
+            rss_items = _fetch_query_news_items(q)
+            if rss_items:
+                fetched_rss.extend(rss_items)
+            if LIVE_SEARCH_ENABLED:
+                live_items = _fetch_live_search_items(q, max_items=max(8, live_items_per_query // 2))
+                if live_items:
+                    fetched_live.extend(live_items)
 
     fetched_combined = _merge_news_items(fetched_rss + fetched_live)
     if fetched_combined:
@@ -2245,8 +2383,9 @@ def run_news_factcheck(text: str, mode: str = "news") -> dict[str, Any]:
         "lang": lang,
         "translated_claim": translated,
         "queries": uniq_queries,
+        "search_queries": retrieval_queries,
         "refresh_info": refresh_info,
-        "query_attempts": len(uniq_queries),
+        "query_attempts": len(retrieval_queries),
         "fetched_count": len(fetched_combined),
         "fetched_rss_count": len(fetched_rss),
         "fetched_live_count": len(fetched_live),
@@ -2282,6 +2421,7 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
     score_reason = normalize_text(str(result.get("score_reason", "")))
     score_why = str(result.get("score_why", "")).strip()
     query_attempts = int(result.get("query_attempts", 0))
+    search_queries = result.get("search_queries") if isinstance(result.get("search_queries"), list) else []
     fetched_count = int(result.get("fetched_count", 0))
     fetched_rss_count = int(result.get("fetched_rss_count", 0))
     fetched_live_count = int(result.get("fetched_live_count", 0))
@@ -2318,7 +2458,9 @@ def build_factcheck_report(result: dict[str, Any]) -> str:
     if score_why:
         lines.append(f"📌 دلیل امتیاز: {score_why}")
     if score_reason == "no_evidence":
-        lines.append("📎 چرا 50/50؟ چون هیچ سند کافی پیدا نشد و نتیجه به‌صورت خنثی/کم‌اطمینان گزارش شده است.")
+        lines.append("📎 چرا امتیاز 0/0؟ چون سند کافی پیدا نشد و امتیازدهی احتمال متوقف شد.")
+    if search_queries:
+        lines.append("🔤 کوئری‌های جست‌وجوی اجراشده: " + " | ".join(str(x)[:70] for x in search_queries[:4]))
     if translated:
         lang = str(result.get("lang", "unknown"))
         if lang == "fa":
@@ -6694,7 +6836,7 @@ def factcheck_news(message):
         message,
         "🔎 در حال فکت‌سنجی اخبار...\n"
         "• بررسی گسترده در 200+ منبع جهانی + 10 منبع داخلی\n"
-        "• جست‌وجوی ترکیبی: RSS + وب زنده (DuckDuckGo/Bing News)\n"
+        "• جست‌وجوی ترکیبی: RSS + وب زنده (Google/DuckDuckGo/Bing)\n"
         "• امتیازدهی موافق/مخالف و جمع‌بندی سندمحور",
     )
     result = run_news_factcheck(source_text, mode="news")
@@ -6765,7 +6907,7 @@ def factcheck_news_pro(message):
         message,
         "🧪 در حال راستی‌آزمایی پیشرفته...\n"
         "• تحلیل خبر با هوش مصنوعی + مدل‌سازی شواهد\n"
-        "• بازیابی ترکیبی: RSS + جست‌وجوی زنده وب\n"
+        "• بازیابی ترکیبی: RSS + جست‌وجوی زنده وب (Google/DuckDuckGo/Bing)\n"
         "• فکت‌چک وب‌محور با OpenAI و منابع لینک‌دار\n"
         "• ترجمه ادعای فارسی برای چک در منابع بین‌المللی\n"
         "• استخراج فکت‌های جزئی و تناقض‌ها\n"
