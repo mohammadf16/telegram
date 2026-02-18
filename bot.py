@@ -1173,8 +1173,9 @@ def call_recommendation_model(prompt: str, max_output_tokens: int = 300) -> str:
 
 
 AI_SYSTEM_PROMPT = (
-    "تو دستیار فارسی هستی. پاسخ‌ها کوتاه، عملی و دقیق باشند. "
-    "اگر کاربر ازت ادامه مکالمه خواست، در همان مسیر ادامه بده."
+    "تو دستیار فارسی هستی. پاسخ‌ها باید کاربردی، روشن و جمع‌وجور باشند. "
+    "معمولاً در 4 تا 8 خط جواب بده. فقط اگر کاربر صریحاً جزئیات بیشتر خواست، طولانی‌تر پاسخ بده. "
+    "اگر کاربر ادامه مکالمه خواست، در همان مسیر ادامه بده."
 )
 
 
@@ -1191,11 +1192,20 @@ def _render_ai_prompt(messages: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def call_ai_chat_model(messages: list[dict[str, str]], max_output_tokens: int = 420) -> str:
+def call_ai_chat_model(messages: list[dict[str, str]], max_output_tokens: int = 260) -> str:
     if not OPENAI_API_KEY:
         return ""
     prompt = _render_ai_prompt(messages)
     return call_recommendation_model(prompt, max_output_tokens=max_output_tokens)
+
+
+def _normalize_ai_output(text: str, max_chars: int = 1100) -> str:
+    out = (text or "").strip()
+    if not out:
+        return out
+    if len(out) > max_chars:
+        out = out[: max_chars - 1].rstrip() + "…"
+    return out
 
 
 def _strip_ai_prefix(text: str) -> str:
@@ -1288,7 +1298,7 @@ def run_ai_chat(message, user_text: str, force_new: bool = False) -> bool:
 
     history.append({"role": "user", "text": prompt})
     history = _trim_ai_thread(history)
-    answer = call_ai_chat_model(history)
+    answer = _normalize_ai_output(call_ai_chat_model(history))
     if not answer:
         bot.reply_to(message, "پاسخ AI موقتاً در دسترس نیست. چند لحظه بعد دوباره تلاش کن.")
         return True
@@ -1870,8 +1880,9 @@ def help_text() -> str:
         "🎯 پیشنهاد شخصی با سوال‌وجواب:\n"
         "/recommend_me\n\n"
         "🤖 چت هوش مصنوعی:\n"
-        "• شروع از صفر: /ask سوال\n"
+        "• شروع از صفر: /ai سوال\n"
         "• ادامه گفتگو: روی جواب AI ریپلای کن و پیام بده\n"
+        "• شروع اجباری مکالمه جدید: /ai_new سوال\n"
         "• وضعیت مصرف گروه: /ai_usage\n\n"
         "🎬 پیشنهاد روزانه:\n"
         "• از دکمه «🎬 پیشنهاد روزانه» پنل کامل را باز کن (بدون کامند)\n"
@@ -3061,26 +3072,30 @@ def recommend_me(message):
     bot.reply_to(message, f"🎯 برای پیشنهاد شخصی، چند سوال کوتاه:\n\n{first_q}")
 
 
-@bot.message_handler(commands=["ask"])
-def ask_gpt(message):
+def _handle_ai_command(message, force_new: bool = True):
     raw = (message.text or "").strip()
     parts = raw.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(
             message,
-            "برای شروع جدید بنویس:\n/ask سوالت\n\n"
+            "برای شروع جدید بنویس:\n/ai سوالت\n\n"
             "برای ادامه گفتگو، روی آخرین جواب AI ریپلای کن و پیام بده.",
         )
         return
-    run_ai_chat(message, parts[1], force_new=True)
+    run_ai_chat(message, parts[1], force_new=force_new)
 
 
-@bot.message_handler(commands=["asknew"])
+@bot.message_handler(commands=["ai", "ask"])
+def ask_gpt(message):
+    _handle_ai_command(message, force_new=True)
+
+
+@bot.message_handler(commands=["ai_new", "asknew"])
 def ask_gpt_new(message):
     raw = (message.text or "").strip()
     parts = raw.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        bot.reply_to(message, "فرمت درست: /asknew سوال")
+        bot.reply_to(message, "فرمت درست: /ai_new سوال")
         return
     run_ai_chat(message, parts[1], force_new=True)
 
@@ -3247,7 +3262,8 @@ def set_gpt(message):
     bot.reply_to(
         message,
         "چت AI فعاله:\n"
-        "• شروع جدید: /ask سوال\n"
+        "• شروع جدید: /ai سوال\n"
+        "• شروع جدید اجباری: /ai_new سوال\n"
         "• ادامه: ریپلای روی جواب AI\n"
         "• مصرف گروه: /ai_usage",
     )
@@ -3733,7 +3749,8 @@ def menu_buttons(message):
             bot.reply_to(
                 message,
                 "🤖 چت AI گروه\n"
-                "• شروع جدید: /ask سوال\n"
+                "• شروع جدید: /ai سوال\n"
+                "• شروع جدید اجباری: /ai_new سوال\n"
                 "• ادامه: روی جواب AI ریپلای کن\n"
                 "• شروع سریع: اول پیام بنویس «هوش »\n"
                 f"• مصرف امروز گروه: {used}/{limit}",
@@ -3742,7 +3759,8 @@ def menu_buttons(message):
             bot.reply_to(
                 message,
                 "🤖 چت AI خصوصی\n"
-                "• شروع جدید: /ask سوال\n"
+                "• شروع جدید: /ai سوال\n"
+                "• شروع جدید اجباری: /ai_new سوال\n"
                 "• ادامه: به پاسخ قبلی ریپلای کن\n"
                 "• شروع سریع: اول پیام بنویس «هوش »",
             )
