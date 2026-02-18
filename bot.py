@@ -1178,7 +1178,34 @@ def call_recommendation_model(prompt: str, max_output_tokens: int = 300) -> str:
         text = data.get("output_text")
         if isinstance(text, str) and text.strip():
             return text.strip()
-        log_ai_debug(f"OpenAI response missing output_text. keys={list(data.keys())[:12]}")
+
+        # Fallback parser for Responses API shapes where output_text is absent.
+        output = data.get("output")
+        if isinstance(output, list):
+            chunks: list[str] = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    # Seen variants: {"type":"output_text","text":"..."} or {"type":"text","text":"..."}
+                    part_text = part.get("text")
+                    if isinstance(part_text, str) and part_text.strip():
+                        chunks.append(part_text.strip())
+            if chunks:
+                return "\n".join(chunks).strip()
+
+        status = data.get("status")
+        err = data.get("error")
+        incomplete = data.get("incomplete_details")
+        log_ai_debug(
+            "OpenAI response had no extractable text. "
+            f"status={status} error={err} incomplete={incomplete} keys={list(data.keys())[:14]}"
+        )
     except requests.Timeout:
         log_ai_debug("OpenAI API request timed out.")
         return ""
