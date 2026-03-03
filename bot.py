@@ -583,6 +583,90 @@ def _default_group_config() -> dict[str, Any]:
         "smart_forward_keywords": [],
     }
 
+MAX_MSG_LEN = 3900  # safe margin under Telegram's ~4096 char limit
+
+def split_long_text(text: str, max_len: int = MAX_MSG_LEN) -> list[str]:
+    """Split long text into clean chunks, preferably between paragraphs"""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+
+    for paragraph in text.split("\n\n"):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+
+        if len(current) + len(paragraph) + 2 <= max_len:
+            current += ("\n\n" if current else "") + paragraph
+        else:
+            if current:
+                chunks.append(current)
+            current = paragraph
+
+            # Handle very long single paragraphs
+            while len(current) > max_len:
+                split_point = current.rfind(" ", 0, max_len)
+                if split_point < max_len // 2:
+                    split_point = max_len
+                chunks.append(current[:split_point].rstrip())
+                current = current[split_point:].lstrip()
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def send_long_message(
+    chat_id: int,
+    text: str,
+    parse_mode: str | None = None,
+    reply_to_message_id: int | None = None,
+    disable_web_page_preview: bool = True,
+    **kwargs,
+):
+    """Send potentially very long text as multiple clean messages"""
+    chunks = split_long_text(text)
+    first = True
+
+    for chunk in chunks:
+        try:
+            if first and reply_to_message_id:
+                # First message replies to original
+                sent = bot.send_message(
+                    chat_id,
+                    chunk,
+                    parse_mode=parse_mode,
+                    reply_to_message_id=reply_to_message_id,
+                    disable_web_page_preview=disable_web_page_preview,
+                    **kwargs
+                )
+                first = False
+            else:
+                # Follow-up messages do not reply → cleaner thread
+                bot.send_message(
+                    chat_id,
+                    chunk,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=disable_web_page_preview,
+                    **kwargs
+                )
+        except telebot.apihelper.ApiTelegramException as e:
+            if "message is too long" in str(e).lower():
+                # Fallback: send without parse_mode
+                bot.send_message(
+                    chat_id,
+                    chunk,
+                    parse_mode=None,
+                    reply_to_message_id=reply_to_message_id if first else None,
+                    disable_web_page_preview=disable_web_page_preview,
+                    **kwargs
+                )
+                first = False
+            else:
+                raise
+
 
 def load_group_settings() -> dict[str, Any]:
     if not os.path.exists(GROUP_SETTINGS_FILE):
@@ -6787,21 +6871,23 @@ def summarize_text_command(message):
 
     status = bot.reply_to(
         message,
-        "🧠 در حال خلاصه‌سازی دقیق متن...\n"
-        "• استخراج نکات اصلی\n"
-        "• حفظ اعداد/نام‌ها/زمان‌ها\n"
-        "• تولید نسخه کوتاه و دقیق",
+        "🧠 در حال خلاصه‌سازی دقیق متن..."
     )
+
     report = run_text_summarizer(message, source_text)
-    try:
-        bot.edit_message_text(
-            report,
-            chat_id=status.chat.id,
-            message_id=status.message_id,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        bot.reply_to(message, report, disable_web_page_preview=True)
+
+    bot.edit_message_text(
+        "خلاصه آماده شد\nمتن کامل در پیام‌های بعدی...",
+        chat_id=status.chat.id,
+        message_id=status.message_id,
+    )
+
+    send_long_message(
+        chat_id=status.chat.id,
+        text=report,
+        parse_mode=None,
+        reply_to_message_id=message.message_id,
+    )
 
 
 def _extract_factcheck_input_text(message) -> str:
@@ -6836,20 +6922,30 @@ def factcheck_news(message):
         message,
         "🔎 در حال فکت‌سنجی اخبار...\n"
         "• بررسی گسترده در 200+ منبع جهانی + 10 منبع داخلی\n"
-        "• جست‌وجوی ترکیبی: RSS + وب زنده (Google/DuckDuckGo/Bing)\n"
-        "• امتیازدهی موافق/مخالف و جمع‌بندی سندمحور",
+        "..."
     )
+
     result = run_news_factcheck(source_text, mode="news")
     report = build_factcheck_report(result)
+
     try:
         bot.edit_message_text(
-            report,
+            "✅ فکت‌سنجی کامل شد\n"
+            "گزارش کامل در پیام‌های بعدی ...",
             chat_id=status.chat.id,
             message_id=status.message_id,
             disable_web_page_preview=True,
         )
-    except Exception:
-        bot.reply_to(message, report, disable_web_page_preview=True)
+
+        send_long_message(
+            chat_id=status.chat.id,
+            text=report,
+            parse_mode=None,  # usually no heavy markdown in fact-check reports
+            reply_to_message_id=message.message_id,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        bot.reply_to(message, f"خطا در ارسال گزارش: {e}")
 
 
 @bot.message_handler(commands=["cred_short", "verify_short", "check_short"])
@@ -6876,15 +6972,19 @@ def factcheck_news_brief(message):
     )
     result = run_news_factcheck(source_text, mode="brief")
     report = build_factcheck_report(result)
-    try:
-        bot.edit_message_text(
-            report,
-            chat_id=status.chat.id,
-            message_id=status.message_id,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        bot.reply_to(message, report, disable_web_page_preview=True)
+
+    bot.edit_message_text(
+        "⚡️ نتیجه خلاصه آماده است\nمتن کامل در پیام بعدی...",
+        chat_id=status.chat.id,
+        message_id=status.message_id,
+    )
+
+    send_long_message(
+        chat_id=status.chat.id,
+        text=report,
+        parse_mode=None,
+        reply_to_message_id=message.message_id,
+    )
 
 
 @bot.message_handler(commands=["fact_pro", "factcheck_pro", "verify_claim"])
@@ -6915,15 +7015,20 @@ def factcheck_news_pro(message):
     )
     result = run_news_factcheck(source_text, mode="pro")
     report = build_factcheck_report(result)
-    try:
-        bot.edit_message_text(
-            report,
-            chat_id=status.chat.id,
-            message_id=status.message_id,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        bot.reply_to(message, report, disable_web_page_preview=True)
+
+    bot.edit_message_text(
+        "🧪 راستی‌آزمایی پیشرفته انجام شد\n"
+        "گزارش کامل (ممکن است چند پیام باشد) ...",
+        chat_id=status.chat.id,
+        message_id=status.message_id,
+    )
+
+    send_long_message(
+        chat_id=status.chat.id,
+        text=report,
+        parse_mode=None,
+        reply_to_message_id=message.message_id,
+    )
 
 
 def is_owner(user_id: int) -> bool:
@@ -7786,17 +7891,14 @@ if __name__ == "__main__":
     init_database()
     me = bot.get_me()
     print(f"Bot started: @{me.username}")
-    print("If group commands do not work, disable privacy in BotFather: /setprivacy -> Disable")
 
     scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
     scheduler_thread.start()
 
     if RUN_MODE == "webhook":
         webhook_url = configure_webhook()
-        print(f"Webhook mode enabled: {webhook_url}")
+        print(f"Webhook mode: {webhook_url}")
         app.run(host=APP_HOST, port=APP_PORT)
     elif RUN_MODE == "polling":
         bot.remove_webhook()
         bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-    else:
-        raise RuntimeError("RUN_MODE must be either 'webhook' or 'polling'.")
