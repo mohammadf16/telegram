@@ -577,7 +577,7 @@ def _default_group_config() -> dict[str, Any]:
         "ai_enabled": True,
         "ai_reply_only": False,
         "ai_daily_limit": 50,
-        "ai_output_tokens": 1000,
+        "ai_output_tokens": 5000,
         "smart_forward_enabled": False,
         "smart_forward_channels": [],
         "smart_forward_keywords": [],
